@@ -13,8 +13,8 @@ from tqdm import trange
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Load tiny nerf data
-images, poses, focal = data_loader('data/tiny_nerf/tiny_nerf_data.npz')
+# Load dataset 
+images, poses, focal = load_tiny('data/tiny_nerf/tiny_nerf_data.npz')
 print(f'Images shape: {images.shape}')
 print(f'Poses shape: {poses.shape}')
 print(f'Focal length: {focal}')
