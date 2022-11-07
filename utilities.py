@@ -49,8 +49,9 @@ def get_rays(height: int,
     i, j = torch.transpose(i, -1, -2), torch.transpose(j, -1, -2)
 
     # Use pinhole camera model to represent grid in terms of camera coordinate frame
-    directions = torch.stack([(i - width * 0.5) / focal_length, 
-                               -(j - height * 0.5) / focal_length,
+    focal = focal_length.item()
+    directions = torch.stack([(i - width * 0.5) / focal, 
+                               -(j - height * 0.5) / focal,
                                -torch.ones_like(i)], dim=-1)
    
     # Apply camera rotation to ray directions

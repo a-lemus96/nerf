@@ -6,15 +6,23 @@ from load_data import *
 from tqdm import trange
 
 # For repeatability
-#seed = 3407
-#torch.manual_seed(seed)
-#np.random.seed(seed)
+'''seed = 3407
+torch.manual_seed(seed)
+np.random.seed(seed)'''
 
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Load dataset 
-images, poses, focal = load_tiny('data/tiny_nerf/tiny_nerf_data.npz')
+# Load dataset
+dataset = load_blender('data/bunny/') 
+images, poses, hwf, d_masks, d_ivals = dataset
+height, width, focal = hwf
+
+near, far = 1.2, 5.
+n_training_imgs = 49
+testimg_idx = 49
+
+'''images, poses, focal = load_tiny('data/tiny_nerf/tiny_nerf_data.npz')
 print(f'Images shape: {images.shape}')
 print(f'Poses shape: {poses.shape}')
 print(f'Focal length: {focal}')
@@ -24,14 +32,15 @@ height, width = images.shape[1:3]
 near, far = 2., 6.
 
 n_training_imgs = 100
-testimg_idx = 101
-testimg, testpose = images[testimg_idx], poses[testimg_idx]
+testimg_idx = 101'''
 
+testimg, testpose = images[testimg_idx], poses[testimg_idx]
+print(poses.shape)
 # Plot origins and directions for all camera axes
 save_origins_and_dirs(poses)
 
-images = torch.from_numpy(images[:n_training_imgs]).to(device)
-poses = torch.from_numpy(poses[:n_training_imgs]).to(device)
+images = torch.from_numpy(images[:n_training_imgs])
+poses = torch.from_numpy(poses[:n_training_imgs])
 focal = torch.from_numpy(focal).to(device)
 testimg = torch.from_numpy(testimg).to(device) 
 testpose = torch.from_numpy(testpose).to(device) 
@@ -124,7 +133,7 @@ inverse_depth = False   # If set, sample points linearly in inverse depth
 d_filter = 128          # Dimension of linear layer filters
 n_layers = 2            # Number of layers in network bottleneck
 skip = []               # Layers at which to apply input residual
-use_fine_model = True   # If set, creates a fine model
+use_fine_model = False  # If set, creates a fine model
 d_filter_fine = 128     # Dimension of linear layer filters of fine network
 n_layers_fine = 6       # Number of layers in fine network bottleneck
 
@@ -136,18 +145,18 @@ perturb_hierarchical = False    # If set, applies noise to sample positions
 lrate = 5e-4            # Learning rate
 
 # Training 
-n_iters = 100000
+n_iters = 10000
 batch_size = 2**14          # Number of rays per gradient step
-one_image_per_step = True   # One image per gradient step (disables batching)
+one_image_per_step = False  # One image per gradient step (disables batching)
 chunksize = 2**14           # Modify as needed to fit in GPU memory
-center_crop = True          # Crop the center of image (one_image_per_)
+center_crop = False         # Crop the center of image (one_image_per_)
 center_crop_iters = 50      # Stop cropping center after this many epochs
-display_rate = 1000          # Display test output every X epochs
+display_rate = 50           # Display test output every X epochs
 val_rate = 25               # Evaluation of test image rate
 
 # Early Stopping
 warmup_iters = 100          # Number of iterations during warmup phase
-warmup_min_fitness = 10.0   # Min val PSNR to continue training at warmup_iters
+warmup_min_fitness = 15.0   # Min val PSNR to continue training at warmup_iters
 n_restarts = 10             # Number of times to restart if training stalls
 
 # Bundle the kwargs for various functions to pass all at once
@@ -240,7 +249,7 @@ def train():
         else:
             # Random over all images.
             batch = rays_rgb[i_batch:i_batch + batch_size]
-            batch = torch.transpose(batch, 0, 1)
+            batch = torch.transpose(batch, 0, 1).to(device)
             rays_o, rays_d, target_img = batch
             height, width = target_img.shape[:2]
             i_batch += batch_size
@@ -280,48 +289,49 @@ def train():
 
         # Evaluate testimg at given display rate
         if i % val_rate == 0:
-            model.eval()
-            height, width = testimg.shape[:2]
-            rays_o, rays_d = get_rays(height, width, focal, testpose)
-            rays_o = rays_o.reshape([-1, 3])
-            rays_d = rays_d.reshape([-1, 3])
-            outputs = nerf_forward(rays_o, rays_d,
-                               near, far, encode, model,
-                               kwargs_sample_stratified=kwargs_sample_stratified,
-                               n_samples_hierarchical=n_samples_hierarchical,
-                               kwargs_sample_hierarchical=kwargs_sample_hierarchical,
-                               fine_model=fine_model,
-                               viewdirs_encoding_fn=encode_viewdirs,
-                               chunksize=chunksize)
-            
-            rgb_predicted = outputs['rgb_map']
-            loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
-            print("Loss:", loss.item())
-            val_psnr = -10. * torch.log10(loss)
+            with torch.no_grad():
+                model.eval()
+                height, width = testimg.shape[:2]
+                rays_o, rays_d = get_rays(height, width, focal, testpose)
+                rays_o = rays_o.reshape([-1, 3])
+                rays_d = rays_d.reshape([-1, 3])
+                outputs = nerf_forward(rays_o, rays_d,
+                                   near, far, encode, model,
+                                   kwargs_sample_stratified=kwargs_sample_stratified,
+                                   n_samples_hierarchical=n_samples_hierarchical,
+                                   kwargs_sample_hierarchical=kwargs_sample_hierarchical,
+                                   fine_model=fine_model,
+                                   viewdirs_encoding_fn=encode_viewdirs,
+                                   chunksize=chunksize)
+                
+                rgb_predicted = outputs['rgb_map']
+                loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
+                print("Loss:", loss.item())
+                val_psnr = -10. * torch.log10(loss)
 
-            val_psnrs.append(val_psnr.item())
-            iternums.append(i)
-            if i % display_rate == 0:
-                # Plot example outputs
-                fig, ax = plt.subplots(1, 4, figsize=(24,4),
-                                       gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
-                ax[0].set_title(f'Iteration: {i}')
-                ax[1].imshow(testimg.detach().cpu().numpy())
-                ax[1].set_title(f'Target')
-                ax[2].plot(range(0, i + 1), train_psnrs, 'r')
-                ax[2].plot(iternums, val_psnrs, 'b')
-                ax[2].set_title('PSNR (train=red, val=blue')
-                z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
-                z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
-                if 'z_vals_hierarchical' in outputs:
-                    z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
-                    z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
-                else:
-                    z_sample_hierarch = None
-                _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
-                ax[3].margins(0)
-                plt.savefig(f"out/training/iteration_{i}.png")
+                val_psnrs.append(val_psnr.item())
+                iternums.append(i)
+                if i % display_rate == 0:
+                    # Plot example outputs
+                    fig, ax = plt.subplots(1, 4, figsize=(24,4),
+                                           gridspec_kw={'width_ratios': [1, 1, 1, 3]})
+                    ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
+                    ax[0].set_title(f'Iteration: {i}')
+                    ax[1].imshow(testimg.detach().cpu().numpy())
+                    ax[1].set_title(f'Target')
+                    ax[2].plot(range(0, i + 1), train_psnrs, 'r')
+                    ax[2].plot(iternums, val_psnrs, 'b')
+                    ax[2].set_title('PSNR (train=red, val=blue')
+                    z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+                    z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
+                    if 'z_vals_hierarchical' in outputs:
+                        z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
+                        z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
+                    else:
+                        z_sample_hierarch = None
+                    _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
+                    ax[3].margins(0)
+                    plt.savefig(f"out/training/iteration_{i}.png")
 
         # Check PSNR for issues and stop if any are found.
         if i == warmup_iters - 1:

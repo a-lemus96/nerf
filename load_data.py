@@ -2,6 +2,7 @@ import os
 import torch
 import imageio
 import numpy as np
+import json
 from typing import Tuple, List, Union, Callable
 
 def load_tiny(
@@ -54,8 +55,8 @@ def load_blender(
         poses.append(np.array(frame['transform_matrix']))
 
     # Convert to numpy arrays
-    imgs = (np.concat(imgs, axis=0) / 255.).astype(np.float32)
-    poses = np.concat(poses, axis=0).astype(np.float32)
+    imgs = (np.stack(imgs, axis=0) / 255.).astype(np.float32)
+    poses = np.stack(poses, axis=0).astype(np.float32)
     
     # Load depth information
     fname_d = os.path.join(basedir, meta['depth_path'] + '.npz') 
@@ -67,6 +68,6 @@ def load_blender(
     H, W = imgs.shape[1:3]
     fov_x = meta['camera_angle_x'] # Field of view along camera x-axis
     focal = 0.5 * W / np.tan(0.5 * fov_x)
-    hwf = [H, W, focal]
+    hwf = [H, W, np.array(focal)]
    
-    return imgs, poses, hwf, d_masks, d_ivals
+    return imgs[..., :-1], poses, hwf, d_masks, d_ivals
