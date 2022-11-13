@@ -1,9 +1,12 @@
 import os
 import torch
+from torch.utils.data import Dataset, DataLoader
 import imageio
 import numpy as np
 import json
+from utilities import *
 from typing import Tuple, List, Union, Callable
+
 
 def load_tiny(
     basedir: str
@@ -68,6 +71,60 @@ def load_blender(
     H, W = imgs.shape[1:3]
     fov_x = meta['camera_angle_x'] # Field of view along camera x-axis
     focal = 0.5 * W / np.tan(0.5 * fov_x)
-    hwf = [H, W, np.array(focal)]
-   
-    return imgs[..., :-1], poses, hwf, d_masks, d_ivals
+    hwf = np.array([H, W, np.array(focal)])
+  
+    imgs = torch.Tensor(imgs[..., :-1]) # discard alpha channel
+    poses = torch.Tensor(poses)
+    hwf = torch.Tensor(hwf)
+    d_masks = torch.Tensor(d_masks)
+    d_ivals = torch.Tensor(d_ivals)
+
+    return imgs[...], poses, hwf, d_masks, d_ivals
+
+# NERF DATASET
+
+class DatasetNeRF(Dataset):
+    def __init__(
+        self,
+        basedir: str,
+        n_imgs: int,
+        test_idx: int,
+        near: int=2.,
+        far: int=7.):
+
+        # Initialize attributes
+        self.basedir = basedir
+        self.n_imgs = n_imgs
+        self.test_idx = test_idx
+        self.near = near # near and far sampling bounds for each ray
+        self.far = far 
+
+        # Load images, camera poses and depth maps
+        data = load_blender(basedir)
+        imgs, poses, hwf, d_masks, ivals = data
+        self.H, self.W, self.focal = hwf
+        
+        # Validation image
+        self.testimg = imgs[test_idx]
+        self.testpose = poses[test_idx]
+
+        # Get rays
+        self.rays = torch.stack([torch.stack(
+            get_rays(self.H, self.W, self.focal, p), 0)
+            for p in poses[:n_imgs]], 0)
+
+        # Append RGB supervision info
+        rays_rgb = torch.cat([self.rays, imgs[:n_imgs, None]], 1)
+        rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
+        rays_rgb = rays_rgb.reshape([-1, rays_rgb.shape[3], 3])
+        
+        self.rays_rgb = rays_rgb.type(torch.float32)
+
+    def __len__(self):
+        return self.rays_rgb.shape[0] 
+
+    def __getitem__(self, idx):
+        ray = self.rays_rgb[idx] 
+        ray_o, ray_d, target_pix = ray 
+        
+        return ray_o, ray_d, target_pix 

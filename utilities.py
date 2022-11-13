@@ -53,13 +53,13 @@ def get_rays(height: int,
     directions = torch.stack([(i - width * 0.5) / focal, 
                                -(j - height * 0.5) / focal,
                                -torch.ones_like(i)], dim=-1)
-   
+
     # Apply camera rotation to ray directions
     directions_world = torch.sum(directions[..., None, :] * camera_pose[:3, :3], axis=-1) 
     # Apply camera translation to ray origin
     origins_world = camera_pose[:3, -1].expand(directions_world.shape)
 
-    return origins_world, directions_world
+    return origins_world, directions_world 
 
 def sample_stratified(
     rays_origins: torch.Tensor,
@@ -106,6 +106,31 @@ def sample_stratified(
 
     return points, z_vals
 
+# DEPTH UTILITIES
+
+def dmap_from_layers(
+    masks: np.ndarray,
+    ivals: np.ndarray,
+    ) -> np.ndarray:
+    '''Convert depth masks and depth intervals to depth map(s) with interval
+       midpoints as the set of discrete depth values.
+    Args:
+        masks: [..., M, H, W]. Set(s) of M boolean  masks.
+        ivals: [M, 2]. Set of M depth intervals.
+    Returns:
+        d_maps: [..., H, W]. Discretized depth map(s).'''
+
+    H, W = masks.shape[-2:] # image dimensions
+
+    # Compute interval mid values
+    mids = (ivals[:, 0] + ivals[:, 1]) / 2.
+    mids = np.expand_dims(mids, axis=(1, 2))
+
+    # Compute pixel depth values according to masks
+    d_maps = masks * mids
+    d_maps = np.sum(d_maps, axis=-3)
+    
+    return d_maps
 
 # VOLUME RENDERING UTILITIES
 

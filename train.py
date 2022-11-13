@@ -1,9 +1,12 @@
+import os
 import torch
 from torch import nn
+from torch.utils.data import Dataset, DataLoader
 from models import *
 from utilities import *
 from load_data import *
-from tqdm import trange
+import logging
+from tqdm import tqdm
 
 # For repeatability
 '''seed = 3407
@@ -14,36 +17,23 @@ np.random.seed(seed)'''
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load dataset
-dataset = load_blender('data/bunny/') 
-images, poses, hwf, d_masks, d_ivals = dataset
-height, width, focal = hwf
+dataset = DatasetNeRF(basedir='data/bunny/',
+                      n_imgs=49,
+                      test_idx=49,
+                      near=1.2,
+                      far=5.)
 
-near, far = 1.2, 5.
-n_training_imgs = 49
-testimg_idx = 49
+testimg, testpose = dataset.testimg, dataset.testpose
 
-'''images, poses, focal = load_tiny('data/tiny_nerf/tiny_nerf_data.npz')
-print(f'Images shape: {images.shape}')
-print(f'Poses shape: {poses.shape}')
-print(f'Focal length: {focal}')
-print('')
-
-height, width = images.shape[1:3]
-near, far = 2., 6.
-
-n_training_imgs = 100
-testimg_idx = 101'''
-
-testimg, testpose = images[testimg_idx], poses[testimg_idx]
-print(poses.shape)
-# Plot origins and directions for all camera axes
-save_origins_and_dirs(poses)
-
+'''
 images = torch.from_numpy(images[:n_training_imgs])
 poses = torch.from_numpy(poses[:n_training_imgs])
 focal = torch.from_numpy(focal).to(device)
 testimg = torch.from_numpy(testimg).to(device) 
 testpose = torch.from_numpy(testpose).to(device) 
+'''
+logger = logging.getLogger()
+base_level = logger.level
 
 # TRAINING CLASSES AND FUNCTIONS
 
@@ -117,6 +107,7 @@ class EarlyStopping:
         return stop
 
 # HYPERPARAMETERS 
+
 # Encoders
 d_input = 3             # Number of input dimensions
 n_freqs = 10            # Number of encoding functions for samples
@@ -146,9 +137,9 @@ lrate = 5e-4            # Learning rate
 
 # Training 
 n_iters = 10000
-batch_size = 2**14          # Number of rays per gradient step
+batch_size = 2**12          # Number of rays per gradient step
 one_image_per_step = False  # One image per gradient step (disables batching)
-chunksize = 2**14           # Modify as needed to fit in GPU memory
+chunksize = 2**12           # Modify as needed to fit in GPU memory
 center_crop = False         # Crop the center of image (one_image_per_)
 center_crop_iters = 50      # Stop cropping center after this many epochs
 display_rate = 50           # Display test output every X epochs
@@ -203,13 +194,7 @@ def init_models():
     else:
         fine_model = None
     
-    # Optimizer
-    optimizer = torch.optim.Adam(model_params, lr=lrate)
-
-    # Early stopping helper
-    warmup_stopper = EarlyStopping(patience=100)
-
-    return model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper
+    return model, fine_model, encode, encode_viewdirs, 
 
 # TRAINING LOOP
 
@@ -217,7 +202,19 @@ def train():
     r"""
     Run NeRF training loop.
     """
-    # Shuffle rays across all images.
+    # Create data loader
+    dataloader = DataLoader(dataset,
+                            batch_size=batch_size,
+                            shuffle=True,
+                            num_workers=8)
+
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=lrate)
+
+    # Early stopping helper
+    warmup_stopper = EarlyStopping(patience=100)
+
+    '''# Shuffle rays across all images.
     if not one_image_per_step:
         height, width = images.shape[1:3]
         all_rays = torch.stack([torch.stack(get_rays(height, width, focal, p), 0)
@@ -227,15 +224,26 @@ def train():
         rays_rgb = rays_rgb.reshape([-1, 3, 3])
         rays_rgb = rays_rgb.type(torch.float32)
         rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
-        i_batch = 0
+        i_batch = 0'''
 
     train_psnrs = []
     val_psnrs = []
     iternums = []
-    for i in trange(n_iters):
+    
+    near, far = dataset.near, dataset.far
+    H, W, focal = dataset.H, dataset.W, dataset.focal
+
+    testimg, testpose = dataset.testimg.to(device), dataset.testpose.to(device)
+
+    # Compute number of epochs
+    steps_per_epoch = np.ceil(len(dataset)/batch_size)
+    epochs = np.ceil(n_iters / steps_per_epoch)
+
+    for i in range(int(epochs)):
+        print(f"Epoch {i + 1}")
         model.train()
 
-        if one_image_per_step:
+        '''if one_image_per_step:
             # Randomly pick an image as the target
             target_img_idx = np.random.randint(images.shape[0])
             target_img = images[target_img_idx].to(device)
@@ -247,55 +255,25 @@ def train():
             rays_o = rays_o.reshape([-1, 3])
             rays_d = rays_d.reshape([-1, 3])
         else:
-            # Random over all images.
-            batch = rays_rgb[i_batch:i_batch + batch_size]
-            batch = torch.transpose(batch, 0, 1).to(device)
-            rays_o, rays_d, target_img = batch
-            height, width = target_img.shape[:2]
-            i_batch += batch_size
+        # Random over all images.
+        batch = rays_rgb[i_batch:i_batch + batch_size]
+        batch = torch.transpose(batch, 0, 1).to(device)
+        rays_o, rays_d, target_img = batch
+        height, width = target_img.shape[:2]
+        i_batch += batch_size
             # Shuffle after one epoch
             if i_batch >= rays_rgb.shape[0]:
                 rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
-                i_batch = 0
-        target_img = target_img.reshape([-1, 3])
+                i_batch = 0'''
+        #target_img = target_img.reshape([-1, 3])
+        for k, (rays_o, rays_d, target_pixs) in enumerate(tqdm(dataloader)): 
+            # Sent data to GPU
+            rays_o = rays_o.to(device)
+            rays_d = rays_d.to(device)
+            target_pixs = target_pixs.to(device)
 
-        # Run one iteration of NeRF and get the rendered RGB image
-        outputs = nerf_forward(rays_o, rays_d,
-                               near, far, encode, model,
-                               kwargs_sample_stratified=kwargs_sample_stratified,
-                               n_samples_hierarchical=n_samples_hierarchical,
-                               kwargs_sample_hierarchical=kwargs_sample_hierarchical,
-                               fine_model=fine_model,
-                               viewdirs_encoding_fn=encode_viewdirs,
-                               chunksize=chunksize)
-
-        # Check for numerical issues
-        for key, val in outputs.items():
-            if torch.isnan(val).any():
-                print(f"! [Numerical Alert] {key} contains NaN.")
-            if torch.isinf(val).any():
-                print(f"! [Numerical Alert] {key} contains Inf.")
-
-        # Perform backpropagation
-        rgb_predicted = outputs['rgb_map']
-        loss = torch.nn.functional.mse_loss(rgb_predicted, target_img)
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-
-        # Compute mean-squared error between predicted and target images
-        psnr = -10. * torch.log10(loss)
-        train_psnrs.append(psnr.item())
-
-        # Evaluate testimg at given display rate
-        if i % val_rate == 0:
-            with torch.no_grad():
-                model.eval()
-                height, width = testimg.shape[:2]
-                rays_o, rays_d = get_rays(height, width, focal, testpose)
-                rays_o = rays_o.reshape([-1, 3])
-                rays_d = rays_d.reshape([-1, 3])
-                outputs = nerf_forward(rays_o, rays_d,
+            # Run one iteration of NeRF and get the rendered RGB image
+            outputs = nerf_forward(rays_o, rays_d,
                                    near, far, encode, model,
                                    kwargs_sample_stratified=kwargs_sample_stratified,
                                    n_samples_hierarchical=n_samples_hierarchical,
@@ -303,56 +281,100 @@ def train():
                                    fine_model=fine_model,
                                    viewdirs_encoding_fn=encode_viewdirs,
                                    chunksize=chunksize)
-                
-                rgb_predicted = outputs['rgb_map']
-                loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
-                print("Loss:", loss.item())
-                val_psnr = -10. * torch.log10(loss)
 
-                val_psnrs.append(val_psnr.item())
-                iternums.append(i)
-                if i % display_rate == 0:
-                    # Plot example outputs
-                    fig, ax = plt.subplots(1, 4, figsize=(24,4),
-                                           gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                    ax[0].imshow(rgb_predicted.reshape([height, width, 3]).detach().cpu().numpy())
-                    ax[0].set_title(f'Iteration: {i}')
-                    ax[1].imshow(testimg.detach().cpu().numpy())
-                    ax[1].set_title(f'Target')
-                    ax[2].plot(range(0, i + 1), train_psnrs, 'r')
-                    ax[2].plot(iternums, val_psnrs, 'b')
-                    ax[2].set_title('PSNR (train=red, val=blue')
-                    z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
-                    z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
-                    if 'z_vals_hierarchical' in outputs:
-                        z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
-                        z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
-                    else:
-                        z_sample_hierarch = None
-                    _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
-                    ax[3].margins(0)
-                    plt.savefig(f"out/training/iteration_{i}.png")
+            # Check for numerical issues
+            for key, val in outputs.items():
+                if torch.isnan(val).any():
+                    print(f"! [Numerical Alert] {key} contains NaN.")
+                if torch.isinf(val).any():
+                    print(f"! [Numerical Alert] {key} contains Inf.")
 
-        # Check PSNR for issues and stop if any are found.
-        if i == warmup_iters - 1:
-            if val_psnr < warmup_min_fitness:
-                print(f'Val PSNR {val_psnr} below warmup_min_fitness {warmup_min_fitness}. Stopping...')
-                return False, train_psnrs, val_psnrs
-        elif i < warmup_iters:
-            if warmup_stopper is not None and warmup_stopper(i, psnr):
-                print(f'Train PSNR flatlined at {psnr} for {warmup_stopper.patience} iters. Stopping...')
-                return False, train_psnrs, val_psnrs
+            # Perform backpropagation
+            rgb_predicted = outputs['rgb_map']
+            loss = torch.nn.functional.mse_loss(rgb_predicted, target_pixs)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
-    return True, train_psnrs, val_psnrs
+            # Compute mean-squared error between predicted and target images
+            psnr = -10. * torch.log10(loss)
+            train_psnrs.append(psnr.item())
+
+            # Evaluate testimg at given display rate
+            step = int(i * steps_per_epoch  + k)
+            if step % val_rate == 0:
+                with torch.no_grad():
+                    model.eval()
+
+                    rays_o, rays_d = get_rays(H, W, focal, testpose)
+                    rays_o = rays_o.reshape([-1, 3])
+                    rays_d = rays_d.reshape([-1, 3])
+                    outputs = nerf_forward(rays_o, rays_d,
+                                       near, far, encode, model,
+                                       kwargs_sample_stratified=kwargs_sample_stratified,
+                                       n_samples_hierarchical=n_samples_hierarchical,
+                                       kwargs_sample_hierarchical=kwargs_sample_hierarchical,
+                                       fine_model=fine_model,
+                                       viewdirs_encoding_fn=encode_viewdirs,
+                                       chunksize=chunksize)
+                    
+                    rgb_predicted = outputs['rgb_map']
+                    val_loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
+                    val_psnr = -10. * torch.log10(val_loss)
+
+                    val_psnrs.append(val_psnr.item())
+                    iternums.append(step)
+                    if step % display_rate == 0:
+                        logger.setLevel(100)
+
+                        # Plot example outputs
+                        fig, ax = plt.subplots(1, 4, figsize=(24,4),
+                                               gridspec_kw={'width_ratios': [1, 1, 1, 3]})
+                        ax[0].imshow(rgb_predicted.reshape([int(H), int(W), 3]).detach().cpu().numpy())
+                        ax[0].set_title(f'Iteration: {step}')
+                        ax[1].imshow(testimg.detach().cpu().numpy())
+                        ax[1].set_title(f'Target')
+                        ax[2].plot(range(0, step + 1), train_psnrs, 'r')
+                        ax[2].plot(iternums, val_psnrs, 'b')
+                        ax[2].set_title('PSNR (train=red, val=blue')
+                        z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+                        z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
+                        if 'z_vals_hierarchical' in outputs:
+                            z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
+                            z_sample_hierarch = z_vals_hierarch[z_vals_hierarch.shape[0] // 2].detach().cpu().numpy()
+                        else:
+                            z_sample_hierarch = None
+                        _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
+                        ax[3].margins(0)
+                        plt.savefig(f"out/training/iteration_{step}.png")
+                        plt.close(fig)
+                        logger.setLevel(base_level)
+
+            # Check PSNR for issues and stop if any are found.
+            if step == warmup_iters - 1:
+                if val_psnr < warmup_min_fitness:
+                    return False, train_psnrs, val_psnrs, 0
+            elif step < warmup_iters:
+                if warmup_stopper is not None and warmup_stopper(step, psnr):
+                    return False, train_psnrs, val_psnrs, 1 
+
+        print("Loss:", val_loss.item())
+
+    return True, train_psnrs, val_psnrs, 2
+
 
 # Run training session(s)
 for k in range(n_restarts):
     print('Training attempt: ', k + 1)
-    model, fine_model, encode, encode_viewdirs, optimizer, warmup_stopper = init_models()
-    success, train_psnrs, val_psnrs = train()
+    model, fine_model, encode, encode_viewdirs = init_models()
+    success, train_psnrs, val_psnrs, code = train()
     if success and val_psnrs[-1] >= warmup_min_fitness:
         print('Training successful!')
         break
+    elif not success and code == 0:
+        print(f'Val PSNR {train_psnrs[-1]} below warmup_min_fitness {warmup_min_fitness}. Stopping...')
+    elif not succes and code == 1:
+        print(f'Train PSNR flatlined for {warmup_stopper.patience} iters. Stopping...')
 
 print('')
 print(f'Done!') 
