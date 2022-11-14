@@ -9,9 +9,9 @@ import logging
 from tqdm import tqdm
 
 # For repeatability
-'''seed = 3407
+seed = 3407
 torch.manual_seed(seed)
-np.random.seed(seed)'''
+np.random.seed(seed)
 
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -22,6 +22,9 @@ dataset = DatasetNeRF(basedir='data/bunny/',
                       test_idx=49,
                       near=1.2,
                       far=5.)
+
+near, far = dataset.near, dataset.far
+H, W, focal = int(dataset.H), int(dataset.W), dataset.focal
 
 testimg, testpose = dataset.testimg, dataset.testpose
 
@@ -122,8 +125,8 @@ inverse_depth = False   # If set, sample points linearly in inverse depth
 
 # Model
 d_filter = 128          # Dimension of linear layer filters
-n_layers = 2            # Number of layers in network bottleneck
-skip = []               # Layers at which to apply input residual
+n_layers = 8            # Number of layers in network bottleneck
+skip = [4]              # Layers at which to apply input residual
 use_fine_model = False  # If set, creates a fine model
 d_filter_fine = 128     # Dimension of linear layer filters of fine network
 n_layers_fine = 6       # Number of layers in fine network bottleneck
@@ -136,10 +139,10 @@ perturb_hierarchical = False    # If set, applies noise to sample positions
 lrate = 5e-4            # Learning rate
 
 # Training 
-n_iters = 10000
+n_iters = 15000
 batch_size = 2**12          # Number of rays per gradient step
 one_image_per_step = False  # One image per gradient step (disables batching)
-chunksize = 2**12           # Modify as needed to fit in GPU memory
+chunksize = 2**11           # Modify as needed to fit in GPU memory
 center_crop = False         # Crop the center of image (one_image_per_)
 center_crop_iters = 50      # Stop cropping center after this many epochs
 display_rate = 50           # Display test output every X epochs
@@ -194,7 +197,7 @@ def init_models():
     else:
         fine_model = None
     
-    return model, fine_model, encode, encode_viewdirs, 
+    return model, fine_model, encode, encode_viewdirs 
 
 # TRAINING LOOP
 
@@ -230,9 +233,6 @@ def train():
     val_psnrs = []
     iternums = []
     
-    near, far = dataset.near, dataset.far
-    H, W, focal = dataset.H, dataset.W, dataset.focal
-
     testimg, testpose = dataset.testimg.to(device), dataset.testpose.to(device)
 
     # Compute number of epochs
@@ -265,7 +265,7 @@ def train():
             if i_batch >= rays_rgb.shape[0]:
                 rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
                 i_batch = 0'''
-        #target_img = target_img.reshape([-1, 3])
+
         for k, (rays_o, rays_d, target_pixs) in enumerate(tqdm(dataloader)): 
             # Sent data to GPU
             rays_o = rays_o.to(device)
@@ -330,7 +330,7 @@ def train():
                         # Plot example outputs
                         fig, ax = plt.subplots(1, 4, figsize=(24,4),
                                                gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                        ax[0].imshow(rgb_predicted.reshape([int(H), int(W), 3]).detach().cpu().numpy())
+                        ax[0].imshow(rgb_predicted.reshape([H, W, 3]).detach().cpu().numpy())
                         ax[0].set_title(f'Iteration: {step}')
                         ax[1].imshow(testimg.detach().cpu().numpy())
                         ax[1].set_title(f'Target')
@@ -362,19 +362,41 @@ def train():
 
     return True, train_psnrs, val_psnrs, 2
 
-
 # Run training session(s)
 for k in range(n_restarts):
     print('Training attempt: ', k + 1)
     model, fine_model, encode, encode_viewdirs = init_models()
     success, train_psnrs, val_psnrs, code = train()
+
     if success and val_psnrs[-1] >= warmup_min_fitness:
         print('Training successful!')
         break
-    elif not success and code == 0:
+    if not success and code == 0:
         print(f'Val PSNR {train_psnrs[-1]} below warmup_min_fitness {warmup_min_fitness}. Stopping...')
-    elif not succes and code == 1:
+    elif not success and code == 1:
         print(f'Train PSNR flatlined for {warmup_stopper.patience} iters. Stopping...')
 
-print('')
-print(f'Done!') 
+
+# Compute camera poses along video rendering path
+render_poses = [pose_from_spherical(3.5, 45., phi)
+                for phi in np.linspace(0, 360, 40, endpoint=False)]
+render_poses = torch.stack(render_poses, 0)
+render_poses = render_poses.to(device)
+
+# Render frames for all rendering poses
+frames = render_path(render_poses=render_poses, 
+                     near=near,
+                     far=far,
+                     hwf=[H, W, focal],
+                     encode=encode,
+                     model=model,
+                     kwargs_sample_stratified=kwargs_sample_stratified,
+                     n_samples_hierarchical=n_samples_hierarchical,
+                     kwargs_sample_hierarchical=kwargs_sample_hierarchical,
+                     fine_model=fine_model,
+                     encode_viewdirs=encode_viewdirs,
+                     chunksize=chunksize)
+
+# Now we put together frames and save result into .mp4 file
+render_video(basedir='out/video/',
+             frames=frames)
