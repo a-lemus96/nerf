@@ -156,13 +156,23 @@ class DatasetNeRF(Dataset):
         self.testimg = imgs[test_idx]
         self.testpose = poses[test_idx]
 
+        # Local rays
+        self.local_dirs = get_rays(self.H, self.W, self.focal, local_only=True)
+        local_dirs = self.local_dirs[None, None, ...].expand(n_imgs, 1,
+                                                             int(self.H),
+                                                             int(self.W), 3) 
+
         # Get rays
         self.rays = torch.stack([torch.stack(
             get_rays(self.H, self.W, self.focal, p), 0)
             for p in poses[:n_imgs]], 0)
 
-        # Append RGB supervision info
-        rays_rgb = torch.cat([self.rays, imgs[:n_imgs, None]], 1)
+        # Append RGB supervision and local rays dirs info
+        rays_rgb = torch.cat([self.rays,
+                              local_dirs,
+                              imgs[:n_imgs, None]], 1)
+
+        # Rearrange data and reshape
         rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = rays_rgb.reshape([-1, rays_rgb.shape[3], 3])
         
@@ -172,7 +182,7 @@ class DatasetNeRF(Dataset):
         return self.rays_rgb.shape[0] 
 
     def __getitem__(self, idx):
-        ray = self.rays_rgb[idx] 
-        ray_o, ray_d, target_pix = ray 
+        ray_info = self.rays_rgb[idx]
+        ray_o, ray_d, local_d, target_pix = ray_info 
         
-        return ray_o, ray_d, target_pix 
+        return ray_o, ray_d, local_d, target_pix 

@@ -9,13 +9,13 @@ import logging
 from tqdm import tqdm
 
 # For repeatability
-seed = 3407
+seed = 451
 torch.manual_seed(seed)
 np.random.seed(seed)
 
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+print(device)
 # Load dataset
 dataset = DatasetNeRF(basedir='data/bunny/',
                       n_imgs=49,
@@ -266,21 +266,24 @@ def train():
                 rays_rgb = rays_rgb[torch.randperm(rays_rgb.shape[0])]
                 i_batch = 0'''
 
-        for k, (rays_o, rays_d, target_pixs) in enumerate(tqdm(dataloader)): 
+        for k, batch in enumerate(tqdm(dataloader)): 
+            rays_o, rays_d, local_d, target_pixs = batch
+
             # Sent data to GPU
             rays_o = rays_o.to(device)
             rays_d = rays_d.to(device)
+            local_d = local_d.to(device)
             target_pixs = target_pixs.to(device)
 
             # Run one iteration of NeRF and get the rendered RGB image
-            outputs = nerf_forward(rays_o, rays_d,
-                                   near, far, encode, model,
-                                   kwargs_sample_stratified=kwargs_sample_stratified,
-                                   n_samples_hierarchical=n_samples_hierarchical,
-                                   kwargs_sample_hierarchical=kwargs_sample_hierarchical,
-                                   fine_model=fine_model,
-                                   viewdirs_encoding_fn=encode_viewdirs,
-                                   chunksize=chunksize)
+            outputs = nerf_forward(rays_o, rays_d, local_d,
+                           near, far, encode, model,
+                           kwargs_sample_stratified=kwargs_sample_stratified,
+                           n_samples_hierarchical=n_samples_hierarchical,
+                           kwargs_sample_hierarchical=kwargs_sample_hierarchical,
+                           fine_model=fine_model,
+                           viewdirs_encoding_fn=encode_viewdirs,
+                           chunksize=chunksize)
 
             # Check for numerical issues
             for key, val in outputs.items():
@@ -307,9 +310,11 @@ def train():
                     model.eval()
 
                     rays_o, rays_d = get_rays(H, W, focal, testpose)
+                    local_d = dataset.local_dirs.to(device) 
                     rays_o = rays_o.reshape([-1, 3])
                     rays_d = rays_d.reshape([-1, 3])
-                    outputs = nerf_forward(rays_o, rays_d,
+                    local_d = local_d.reshape([-1, 3])
+                    outputs = nerf_forward(rays_o, rays_d, local_d,
                                        near, far, encode, model,
                                        kwargs_sample_stratified=kwargs_sample_stratified,
                                        n_samples_hierarchical=n_samples_hierarchical,
@@ -319,6 +324,7 @@ def train():
                                        chunksize=chunksize)
                     
                     rgb_predicted = outputs['rgb_map']
+                    depth_predicted = outputs['depth_map']
                     val_loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
                     val_psnr = -10. * torch.log10(val_loss)
 
@@ -330,14 +336,16 @@ def train():
                         # Plot example outputs
                         fig, ax = plt.subplots(1, 4, figsize=(24,4),
                                                gridspec_kw={'width_ratios': [1, 1, 1, 3]})
-                        ax[0].imshow(rgb_predicted.reshape([H, W, 3]).detach().cpu().numpy())
+                        ax[0].imshow(rgb_predicted.reshape([H, W, 3]).cpu().numpy())
                         ax[0].set_title(f'Iteration: {step}')
-                        ax[1].imshow(testimg.detach().cpu().numpy())
+                        ax[1].imshow(testimg.cpu().numpy())
                         ax[1].set_title(f'Target')
-                        ax[2].plot(range(0, step + 1), train_psnrs, 'r')
-                        ax[2].plot(iternums, val_psnrs, 'b')
-                        ax[2].set_title('PSNR (train=red, val=blue')
-                        z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+                        ax[2].imshow(depth_predicted.reshape([H, W]).cpu().numpy())
+                        ax[2].set_title(r'Depth map: $Z_{cam}$')
+                        ax[3].plot(range(0, step + 1), train_psnrs, 'r')
+                        ax[3].plot(iternums, val_psnrs, 'b')
+                        ax[3].set_title('PSNR (train=red, val=blue')
+                        '''z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
                         z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
                         if 'z_vals_hierarchical' in outputs:
                             z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
@@ -345,7 +353,7 @@ def train():
                         else:
                             z_sample_hierarch = None
                         _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[3])
-                        ax[3].margins(0)
+                        ax[3].margins(0)'''
                         plt.savefig(f"out/training/iteration_{step}.png")
                         plt.close(fig)
                         logger.setLevel(base_level)

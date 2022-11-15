@@ -32,17 +32,24 @@ def save_origins_and_dirs(poses):
 def get_rays(height: int,
              width: int,
              focal_length: float,
-             camera_pose: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+             camera_pose: torch.Tensor=None,
+             local_only: bool=False
+             ) -> Tuple[torch.Tensor, torch.Tensor]:
     '''Find origin and direction of rays through every pixel and camera origin.
     Args:
         height: Image height.
         width: Image width.
         focal_length: Focal length of the camera.
         camera_pose: [4, 4]. Camera pose matrix.
+        local_only: bool. If set, return ray dirs in camera frame.
     Returns:
         origins_world: [height, width, 3]. Coordinates of rays using world coordinates.
         directions_world: [height, width, 3]. Orientations of rays in world coordinates.
     '''
+    if camera_pose is None and not local_only:
+        raise ValueError("Non local coordinates of camera rays require camera_pose parameter.")
+
+
     # Create grid of coordinates
     i, j = torch.meshgrid(torch.arange(width, dtype=torch.float32).to(camera_pose), 
                           torch.arange(height, dtype=torch.float32).to(camera_pose), 
@@ -54,6 +61,9 @@ def get_rays(height: int,
     directions = torch.stack([(i - width * 0.5) / focal, 
                                -(j - height * 0.5) / focal,
                                -torch.ones_like(i)], dim=-1)
+
+    if local_only:
+        return directions
 
     # Apply camera rotation to ray directions
     directions_world = torch.sum(directions[..., None, :] * camera_pose[:3, :3], axis=-1) 
@@ -79,7 +89,7 @@ def sample_stratified(
         far: Far bound for sampling.
         n_samples: Number of samples.
         perturb: Use random sampling from within each bin. If disabled, use bin delimiters as sample points.
-        inversse_depth:
+        inverse_depth:
     Returns:
         points: [height, width, n_samples, 3]. World coordinates for all samples along every ray.  
         z_vals: [height, width, n_samples]. Samples expressed as distances along every ray.
@@ -131,6 +141,7 @@ def dmap_from_layers(
     d_maps = masks * mids
     d_maps = np.sum(d_maps, axis=-3)
     
+    
     return d_maps
 
 # VOLUME RENDERING UTILITIES
@@ -156,6 +167,7 @@ def cumprod_exclusive(tensor: torch.Tensor) -> torch.Tensor:
 def raw2outputs(raw: torch.Tensor,
                 z_vals: torch.Tensor,
                 rays_dirs: torch.Tensor,
+                local_dirs: torch.Tensor,
                 raw_noise_std: float = 0.0,
                 white_background: bool = False) -> Tuple[torch.Tensor,
                                                          torch.Tensor,
@@ -167,6 +179,7 @@ def raw2outputs(raw: torch.Tensor,
             along axis=-1 represent RGB color. 
        z_vals: [N, n_samples]: N sets of n_samples along different camera rays.
        rays_dirs: [N, 3]. N camera ray directions.
+       local_dirs: [N, 3]. N camera-centered ray directions.
     Returns:
         rgb_map: [N, 3]. RGB rendered values for each ray.
         depth_map: [N]. Estimation for depth map.
@@ -198,7 +211,8 @@ def raw2outputs(raw: torch.Tensor,
     rgb_map = torch.sum(weights[..., None] * rgb, dim=-2) 
     
     # Depth map estimation computed as predicted distance.
-    depth_map = torch.sum(weights * z_vals, dim=-1)
+    termination = torch.sum(weights * z_vals, dim=-1)
+    depth_map = termination * local_dirs[:, -1] 
 
     # Disparity map is computed as the inverse depth
     disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map),
@@ -346,6 +360,7 @@ def prepare_viewdirs_chunks(
 def nerf_forward(
     rays_o: torch.Tensor,
     rays_d: torch.Tensor,
+    local_d: torch.Tensor,
     near: float,
     far: float,
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
@@ -391,7 +406,8 @@ def nerf_forward(
     raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
 
     # Perform differentiable volume rendering
-    rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d)
+    rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d,
+                                                       local_d)
     outputs = {'z_vals_stratified': z_vals}
     
     # Fine model pass
@@ -423,7 +439,7 @@ def nerf_forward(
 
         # Perform differentiable volume rendering on fine predictions
         rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals_combined,
-                                                           rays_d)
+                                                           rays_d, local_d)
 
         # Store outputs.
         outputs['z_vals_hierarchical'] = z_hierarch
