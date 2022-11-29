@@ -27,6 +27,7 @@ class PositionalEncoder(nn.Module):
             self.embedding_fns.append(lambda x, freq=freq: torch.sin(x * freq))
             self.embedding_fns.append(lambda x, freq=freq: torch.sin(x* freq))
 
+
     # Forward method for passing inputs to the model
     def forward(self, 
                 x) -> torch.Tensor:

@@ -62,6 +62,9 @@ def get_rays(height: int,
                                -(j - height * 0.5) / focal,
                                -torch.ones_like(i)], dim=-1)
 
+    # Normalize directions
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+
     if local_only:
         return directions
 
@@ -117,12 +120,56 @@ def sample_stratified(
 
     return points, z_vals
 
+def sample_normal(
+    rays_o: torch.Tensor,
+    rays_d: torch.Tensor,
+    z_strat: torch.Tensor,
+    means: torch.Tensor,
+    stdevs: torch.Tensor,
+    near: float,
+    far: float,
+    n_samples: int,
+    inverse_depth: bool = False
+    ) -> Tuple:
+    '''Sample along rays using Gaussian sampling appoach. For each ray, two vals
+    expected: mean and stdev defining a Gaussian distribution to take n_samples
+    from.
+    Args:
+        rays_o: [..., 3]. Ray origins (world coordinates).
+        rays_d: [..., 3]. Ray directions (world coordinates).
+        z_strat: [..., n_samples_stratified]. Stratified samples
+        means: [...]. Mean values for each ray.
+        stdevs: [...]. Std. deviation values for each ray.
+        near: Near bound for sampling.
+        far: Far bound for sampling.
+        n_samples: Number of samples.
+        inverse_depth: If set. Use inverse depth instead of depth for sampling. 
+    Returns:
+        points: [..., n_samples, 3]. World coords for samples along every ray.  
+        z_vals: [..., n_samples]. Samples as distances along every ray.
+    '''
+    # Grab samples for parameter t
+    z_vals = torch.normal(0., 1., size=list(rays_d.shape[:-1]) + [n_samples],
+                          device=means.device)
+    z_vals = (z_vals * stdevs[..., None]) + means[..., None] 
+
+    # Clip values according to near and far bounds
+    z_vals = torch.clamp(z_vals, min=near)
+
+    # Concatenate and sort stratified and normal samples
+    z_vals, _ = torch.sort(torch.cat([z_vals, z_strat], -1), -1)
+
+    # Compute world coordinates for ray samples
+    points = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None] 
+    
+    return points, z_vals
+
 # DEPTH UTILITIES
 
 def dmap_from_layers(
-    masks: np.ndarray,
-    ivals: np.ndarray,
-    ) -> np.ndarray:
+    masks: torch.Tensor,
+    ivals: torch.Tensor,
+    ) -> torch.Tensor:
     '''Convert depth masks and depth intervals to depth map(s) with interval
        midpoints as the set of discrete depth values.
     Args:
@@ -133,16 +180,11 @@ def dmap_from_layers(
 
     H, W = masks.shape[-2:] # image dimensions
 
-    # Compute interval mid values
-    mids = (ivals[:, 0] + ivals[:, 1]) / 2.
-    mids = np.expand_dims(mids, axis=(1, 2))
-
     # Compute pixel depth values according to masks
-    d_maps = masks * mids
-    d_maps = np.sum(d_maps, axis=-3)
-    
+    d_maps = masks[..., None] * ivals[None, :, None, None, :]
     
     return d_maps
+
 
 # VOLUME RENDERING UTILITIES
 
@@ -167,7 +209,6 @@ def cumprod_exclusive(tensor: torch.Tensor) -> torch.Tensor:
 def raw2outputs(raw: torch.Tensor,
                 z_vals: torch.Tensor,
                 rays_dirs: torch.Tensor,
-                local_dirs: torch.Tensor,
                 raw_noise_std: float = 0.0,
                 white_background: bool = False) -> Tuple[torch.Tensor,
                                                          torch.Tensor,
@@ -179,7 +220,6 @@ def raw2outputs(raw: torch.Tensor,
             along axis=-1 represent RGB color. 
        z_vals: [N, n_samples]: N sets of n_samples along different camera rays.
        rays_dirs: [N, 3]. N camera ray directions.
-       local_dirs: [N, 3]. N camera-centered ray directions.
     Returns:
         rgb_map: [N, 3]. RGB rendered values for each ray.
         depth_map: [N]. Estimation for depth map.
@@ -211,8 +251,7 @@ def raw2outputs(raw: torch.Tensor,
     rgb_map = torch.sum(weights[..., None] * rgb, dim=-2) 
     
     # Depth map estimation computed as predicted distance.
-    termination = torch.sum(weights * z_vals, dim=-1)
-    depth_map = termination * local_dirs[:, -1] 
+    depth_map = torch.sum(weights * z_vals, dim=-1)
 
     # Disparity map is computed as the inverse depth
     disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map),
@@ -360,12 +399,13 @@ def prepare_viewdirs_chunks(
 def nerf_forward(
     rays_o: torch.Tensor,
     rays_d: torch.Tensor,
-    local_d: torch.Tensor,
     near: float,
     far: float,
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
     coarse_model: nn.Module,
-    kwargs_sample_stratified: dict = None,
+    t_ivals: torch.Tensor = None,
+    kwargs_sample_stratified: dict = None, 
+    kwargs_sample_normal: dict = None,
     n_samples_hierarchical: int = 0,
     kwargs_sample_hierarchical: dict = None,
     fine_model = None,
@@ -377,16 +417,23 @@ def nerf_forward(
     Args:
     Returns:
     """
-    # Set no kwargs if none are given
-    if kwargs_sample_stratified is None:
-        kwargs_sample_stratified = {}
-    if kwargs_sample_hierarchical is None:
-        kwargs_sample_hierarchical = {}
+    if t_ivals is not None:
+        # Compute mean and stdev for all intervals
+        means = (t_ivals[..., 0] + t_ivals[..., 1])/ 2.      
+        stdevs = t_ivals[..., 1] - t_ivals[..., 0]
 
     # Sample query points along each ray
-    query_points, z_vals = sample_stratified(rays_o, rays_d, near, far,
+    if kwargs_sample_stratified is not None:
+        query_points, z_vals = sample_stratified(rays_o, rays_d, near, far,
                                              **kwargs_sample_stratified)
+
+    if kwargs_sample_normal is not None: 
+        query_points, z_vals = sample_normal(rays_o, rays_d, z_vals, means,
+                                             stdevs, near, far,
+                                             **kwargs_sample_normal)
     
+    outputs = {'z_vals_stratified': z_vals}
+
     # Prepare batches
     batches = prepare_chunks(query_points, encoding_fn, chunksize=chunksize)
     if viewdirs_encoding_fn is not None:
@@ -406,46 +453,46 @@ def nerf_forward(
     raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
 
     # Perform differentiable volume rendering
-    rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d,
-                                                       local_d)
-    outputs = {'z_vals_stratified': z_vals}
+    rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d)
     
-    # Fine model pass
-    if n_samples_hierarchical > 0:
-        # Save previous outputs to return
-        rgb_map_0, depth_map_0, acc_map_0 = rgb_map, depth_map, acc_map
+    if kwargs_sample_hierarchical is not None:
+        # Fine model pass
+        if n_samples_hierarchical > 0:
+            # Save previous outputs to return
+            rgb_map_0, depth_map_0, acc_map_0 = rgb_map, depth_map, acc_map
 
-        # Apply hierarchical sampling for fine query points
-        query_points, z_vals_combined, z_hierarch = sample_hierarchical(
-                rays_o, rays_d, z_vals, weights, n_samples_hierarchical,
-                **kwargs_sample_hierarchical)
+            # Apply hierarchical sampling for fine query points
+            query_points, z_vals_combined, z_hierarch = sample_hierarchical(
+                    rays_o, rays_d, z_vals, weights, n_samples_hierarchical,
+                    **kwargs_sample_hierarchical)
 
-        # Prepare inputs
-        batches = prepare_chunks(query_points, encoding_fn, chunksize=chunksize)
-        if viewdirs_encoding_fn is not None:
-            batches_viewdirs = prepare_viewdirs_chunks(query_points, rays_d,
-                                                       viewdirs_encoding_fn,
-                                                       chunksize=chunksize)
-        else:
-            batches_viewdirs = [None] * len(batches)
+            # Prepare inputs
+            batches = prepare_chunks(query_points, encoding_fn, chunksize=chunksize)
+            if viewdirs_encoding_fn is not None:
+                batches_viewdirs = prepare_viewdirs_chunks(query_points, rays_d,
+                                                           viewdirs_encoding_fn,
+                                                           chunksize=chunksize)
+            else:
+                batches_viewdirs = [None] * len(batches)
 
-        # Forward pass new samples through fine model
-        fine_model = fine_model if fine_model is not None else coarse_model
-        predictions = []
-        for batch, batch_viewdirs in zip(batches, batches_viewdirs):
-            predictions.append(fine_model(batch, viewdirs=batch_viewdirs))
-        raw = torch.cat(predictions, dim=0)
-        raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
+            # Forward pass new samples through fine model
+            fine_model = fine_model if fine_model is not None else coarse_model
+            predictions = []
+            for batch, batch_viewdirs in zip(batches, batches_viewdirs):
+                predictions.append(fine_model(batch, viewdirs=batch_viewdirs))
+            raw = torch.cat(predictions, dim=0)
+            raw = raw.reshape(list(query_points.shape[:2]) + [raw.shape[-1]])
 
-        # Perform differentiable volume rendering on fine predictions
-        rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals_combined,
-                                                           rays_d, local_d)
+            # Perform differentiable volume rendering on fine predictions
+            rgb_map, depth_map, acc_map, weights = raw2outputs(raw, z_vals_combined,
+                                                               rays_d)
 
-        # Store outputs.
-        outputs['z_vals_hierarchical'] = z_hierarch
-        outputs['rgb_map_0'] = rgb_map_0
-        outputs['depth_map_0'] = depth_map_0
-        outputs['acc_map_0'] = acc_map_0
+            # Store outputs.
+            outputs['z_vals_hierarchical'] = z_hierarch
+            outputs['z_vals_combined'] = z_vals_combined
+            outputs['rgb_map_0'] = rgb_map_0
+            outputs['depth_map_0'] = depth_map_0
+            outputs['acc_map_0'] = acc_map_0 
 
     outputs['rgb_map'] = rgb_map
     outputs['depth_map'] = depth_map
@@ -522,3 +569,31 @@ def render_video(
         frames: [N, H, W, 3]. N video frames."""
 
     imageio.mimwrite(basedir + 'rgb.mp4', to8b(frames), fps=30, quality=8)
+
+
+# TRAINING UTILITIES
+class CustomScheduler:
+
+  def __init__(
+    self,
+    optimizer,
+    n_iters,
+    etaN = 5e-6,
+    lambW = 0.01,
+    n_warmup = 2500,
+  ):
+    self.optimizer = optimizer
+    self.eta0 = optimizer.param_groups[0]['lr']
+    self.etaN = etaN
+    self.lambW = lambW
+    self.n_warmup = n_warmup
+    self.iters = 0
+    self.n_iters = n_iters
+
+  def step(self):
+    lr = (self.lambW + (1 - self.lambW) * np.sin(np.pi/2 * np.clip(self.iters/self.n_warmup,0,1)))
+    lr *= np.exp((1 - self.iters/self.n_iters)*np.log(self.eta0) + (self.iters/self.n_iters)*np.log(self.etaN))
+
+    self.iters += 1
+
+    self.optimizer.param_groups[0]['lr'] = lr

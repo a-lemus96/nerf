@@ -149,8 +149,12 @@ class DatasetNeRF(Dataset):
 
         # Load images, camera poses and depth maps
         data = load_blender(basedir)
-        imgs, poses, hwf, d_masks, ivals = data
-        self.H, self.W, self.focal = hwf
+        imgs, poses, hwf, masks, ivals = data
+        #plt.imshow(masks[0, -1, ...], cmap='gray')
+
+        H, W, self.focal = hwf
+        self.H, self.W = int(H), int(W)
+        N = imgs.shape[0]
         
         # Validation image
         self.testimg = imgs[test_idx]
@@ -158,31 +162,47 @@ class DatasetNeRF(Dataset):
 
         # Local rays
         self.local_dirs = get_rays(self.H, self.W, self.focal, local_only=True)
-        local_dirs = self.local_dirs[None, None, ...].expand(n_imgs, 1,
-                                                             int(self.H),
-                                                             int(self.W), 3) 
+        local_dirs = self.local_dirs[None, None, ...].expand(N, 1, self.H,
+                                                             self.W, 3)
+
+        # Compute depth intervals along rays
+        d_ivals = torch.sum(dmap_from_layers(masks=masks, ivals=ivals), 1)
+        d_ivals = -d_ivals[:, None, ...]
+        t_ivals = d_ivals / local_dirs[..., -1, None]
+        self.test_ivals = t_ivals[test_idx]
+        bkgd = masks[:, -1, ...].reshape(list(t_ivals.shape[:-1]) + [1])
+        bkgd = bkgd.type(torch.float32)
+        t_ivals = torch.cat((t_ivals, bkgd), -1)
+
+        t_ivals = t_ivals[:n_imgs]
+        t_ivals = torch.permute(t_ivals, [0, 2, 3, 1, 4])
+        t_ivals = t_ivals.reshape([-1, t_ivals.shape[3], 3])
+        t_ivals = torch.transpose(t_ivals, 0, 1)
+        t_ivals = t_ivals[0]
+        self.t_ivals = t_ivals.type(torch.float32)
 
         # Get rays
         self.rays = torch.stack([torch.stack(
-            get_rays(self.H, self.W, self.focal, p), 0)
-            for p in poses[:n_imgs]], 0)
+                                 get_rays(self.H, self.W, self.focal, p), 0)
+                                 for p in poses[:n_imgs]], 0)
 
         # Append RGB supervision and local rays dirs info
         rays_rgb = torch.cat([self.rays,
-                              local_dirs,
-                              imgs[:n_imgs, None]], 1)
+                              imgs[:n_imgs, None]], 1) 
 
         # Rearrange data and reshape
         rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = rays_rgb.reshape([-1, rays_rgb.shape[3], 3])
+        rays_rgb = torch.transpose(rays_rgb, 0, 1)
         
-        self.rays_rgb = rays_rgb.type(torch.float32)
+        self.rays_rgb = rays_rgb.type(torch.float32) 
 
     def __len__(self):
-        return self.rays_rgb.shape[0] 
+        return self.rays_rgb.shape[1] 
 
     def __getitem__(self, idx):
-        ray_info = self.rays_rgb[idx]
-        ray_o, ray_d, local_d, target_pix = ray_info 
-        
-        return ray_o, ray_d, local_d, target_pix 
+        rays_o, rays_d, target_pixs = self.rays_rgb[:, idx]
+        t_ivals = self.t_ivals[idx, ..., :2]
+        bkgds = self.t_ivals[idx, ..., 2]
+ 
+        return rays_o, rays_d, target_pixs, t_ivals, bkgds
