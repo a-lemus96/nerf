@@ -78,11 +78,13 @@ def load_tiny(
 
 def load_blender(
     basedir: str,
+    depth: bool = False,
     ) -> Tuple:
     """Loads blender dataset.
     ----------------------------------------------------------------------------
     Args:
         basedir: str. Basepath that contains all files.
+        depth: bool. If set, return depth information.
     Returns:
         imgs: [N, H, W, 3]. N HxW RGB images.
         poses: [N, 4, 4]. N 4x4 camera poses.
@@ -94,41 +96,50 @@ def load_blender(
     with open(os.path.join(basedir, 'transforms_train.json'), 'r') as fp:
         meta = json.load(fp)
 
-    # Load frames and poses
-    imgs = []
-    poses = []
-    for frame in meta['frames']:
-        fname = os.path.join(basedir, frame['image_path'] + '.png')
-        imgs.append(imageio.imread(fname))
-        poses.append(np.array(frame['transform_matrix']))
+    if not depth:
+        # Load frames and poses
+        imgs = []
+        poses = []
+        for frame in meta['frames']:
+            fname = os.path.join(basedir, frame['image_path'] + '.png')
+            imgs.append(imageio.imread(fname))
+            poses.append(np.array(frame['transform_matrix']))
 
-    # Convert to numpy arrays
-    imgs = (np.stack(imgs, axis=0) / 255.).astype(np.float32)
-    poses = np.stack(poses, axis=0).astype(np.float32)
-    
-    # Load depth information
-    fname_d = os.path.join(basedir, meta['depth_path'] + '.npz') 
-    d_data = np.load(fname_d)
-    d_masks = d_data['masks']
-    d_ivals = d_data['intervals'] 
+        # Convert to numpy arrays
+        imgs = (np.stack(imgs, axis=0) / 255.).astype(np.float32)
+        poses = np.stack(poses, axis=0).astype(np.float32)
+        
+        # Compute image height, width and camera's focal length
+        H, W = imgs.shape[1:3]
+        fov_x = meta['camera_angle_x'] # Field of view along camera x-axis
+        focal = 0.5 * W / np.tan(0.5 * fov_x)
+        hwf = np.array([H, W, np.array(focal)])
+      
+        imgs = torch.Tensor(imgs[..., :-1]) # discard alpha channel
+        poses = torch.Tensor(poses)
+        hwf = torch.Tensor(hwf)
 
-    # Compute image height, width and camera's focal length
-    H, W = imgs.shape[1:3]
-    fov_x = meta['camera_angle_x'] # Field of view along camera x-axis
-    focal = 0.5 * W / np.tan(0.5 * fov_x)
-    hwf = np.array([H, W, np.array(focal)])
-  
-    imgs = torch.Tensor(imgs[..., :-1]) # discard alpha channel
-    poses = torch.Tensor(poses)
-    hwf = torch.Tensor(hwf)
-    d_masks = torch.Tensor(d_masks)
-    d_ivals = torch.Tensor(d_ivals)
+        # Return frames data
+        data =(imgs, poses, hwf) 
 
-    return imgs[...], poses, hwf, d_masks, d_ivals
+    else: 
+        # Load depth information
+        fname_d = os.path.join(basedir, meta['depth_path'] + '.npz') 
+        d_data = np.load(fname_d)
+        d_masks = d_data['masks']
+        d_ivals = d_data['intervals'] 
+
+        d_masks = torch.Tensor(d_masks)
+        d_ivals = torch.Tensor(d_ivals)
+
+        # Return depth data only 
+        data = (d_masks, d_ivals) 
+
+    return data 
 
 # NERF DATASET
 
-class DatasetNeRF(Dataset):
+class NerfDataset(Dataset):
     r"""NeRF dataset. A NeRF dataset consists of N x H x W ray origins and
     directions relative to the world frame. Here, N is the number of training
     images of size H x W."""
@@ -147,19 +158,64 @@ class DatasetNeRF(Dataset):
         self.near = near # near and far sampling bounds for each ray
         self.far = far 
 
-        # Load images, camera poses and depth maps
+        # Load images and camera poses 
         data = load_blender(basedir)
-        imgs, poses, hwf, masks, ivals = data
-        #plt.imshow(masks[0, -1, ...], cmap='gray')
+        imgs, poses, hwf = data
+
+        # Validation image
+        self.testimg = imgs[test_idx]
+        self.testpose = poses[test_idx]
 
         H, W, self.focal = hwf
         self.H, self.W = int(H), int(W)
         N = imgs.shape[0]
         
-        # Validation image
-        self.testimg = imgs[test_idx]
-        self.testpose = poses[test_idx]
+        # Get rays
+        self.rays = torch.stack([torch.stack(
+                                 get_rays(self.H, self.W, self.focal, p), 0)
+                                 for p in poses[:n_imgs]], 0)
 
+        # Append RGB supervision and local rays dirs info
+        rays_rgb = torch.cat([self.rays,
+                              imgs[:n_imgs, None]], 1) 
+
+        # Rearrange data and reshape
+        rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
+        rays_rgb = rays_rgb.reshape([-1, rays_rgb.shape[3], 3])
+        rays_rgb = torch.transpose(rays_rgb, 0, 1)
+        
+        self.rays_rgb = rays_rgb.type(torch.float32) 
+
+    def __len__(self):
+        return self.rays_rgb.shape[1] 
+
+    def __getitem__(self, idx):
+        rays_o, rays_d, target_pixs = self.rays_rgb[:, idx]
+        
+        return rays_o, rays_d, target_pixs 
+
+# DEPTH SUPERVISED NERF DATASET
+
+class DSNerfDataset(NerfDataset):
+    r"""Depth supervised NeRF dataset. It consists of N x H x W ray origins and
+    directions relative to the world frame. Here, N is the number of training
+    images of size H x W. It also contains depth information associated to each
+    ray."""
+    def __init__(
+        self,
+        basedir: str,
+        n_imgs: int,
+        test_idx: int,
+        near: int=2.,
+        far: int=7.): 
+        # Call base class constructor method
+        super().__init__(basedir, n_imgs, test_idx, near, far)
+
+        # Load images, camera poses and depth maps
+        data = load_blender(basedir, depth=True)
+        masks, ivals = data
+        N = masks.shape[0]
+ 
         # Local rays
         self.local_dirs = get_rays(self.H, self.W, self.focal, local_only=True)
         local_dirs = self.local_dirs[None, None, ...].expand(N, 1, self.H,
@@ -180,25 +236,6 @@ class DatasetNeRF(Dataset):
         t_ivals = torch.transpose(t_ivals, 0, 1)
         t_ivals = t_ivals[0]
         self.t_ivals = t_ivals.type(torch.float32)
-
-        # Get rays
-        self.rays = torch.stack([torch.stack(
-                                 get_rays(self.H, self.W, self.focal, p), 0)
-                                 for p in poses[:n_imgs]], 0)
-
-        # Append RGB supervision and local rays dirs info
-        rays_rgb = torch.cat([self.rays,
-                              imgs[:n_imgs, None]], 1) 
-
-        # Rearrange data and reshape
-        rays_rgb = torch.permute(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = rays_rgb.reshape([-1, rays_rgb.shape[3], 3])
-        rays_rgb = torch.transpose(rays_rgb, 0, 1)
-        
-        self.rays_rgb = rays_rgb.type(torch.float32) 
-
-    def __len__(self):
-        return self.rays_rgb.shape[1] 
 
     def __getitem__(self, idx):
         rays_o, rays_d, target_pixs = self.rays_rgb[:, idx]

@@ -17,11 +17,11 @@ np.random.seed(seed)'''
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load dataset
-dataset = DatasetNeRF(basedir='data/bunny/',
-                      n_imgs=49,
-                      test_idx=49,
-                      near=1.2,
-                      far=7.)
+dataset = DSNerfDataset(basedir='data/bunny/',
+                        n_imgs=49,
+                        test_idx=49,
+                        near=1.2,
+                        far=7.)
 
 near, far = dataset.near, dataset.far
 H, W, focal = int(dataset.H), int(dataset.W), dataset.focal
