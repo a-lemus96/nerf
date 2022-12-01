@@ -6,12 +6,100 @@ from models import *
 from utilities import *
 from load_data import *
 import logging
+import argparse
 from tqdm import tqdm
 
 # For repeatability
 '''seed = 451
 torch.manual_seed(seed)
 np.random.seed(seed)'''
+
+# HYPERPARAMETERS 
+parser = argparse.ArgumentParser(description='Train DSNeRF for view synthesis.')
+
+# Encoder(s)
+parser.add_argument('--d_input', dest='d_input', default=3, type=int,
+                    help='Spatial input dimension')
+parser.add_argument('--n_freqs', dest='n_freqs', default=10, type=int,
+                    help='Number of encoding functions for spatial coords')
+parser.add_argument('--log_space', dest='log_space', default=True, type=bool,
+                    help='If set, frecuency scale in log space')
+parser.add_argument('--use_viewdirs', dest='use_viewdirs', default=True,
+                    type=bool, help='If set, model view dependent effects')
+parser.add_argument('--n_freqs_views', dest='n_freqs_views', default=4,
+                    type=int, help='Number of encoding functions for view dirs')
+
+# Model(s)
+parser.add_argument('--d_filter', dest='d_filter', default=256, type=int,
+                    help='Linear layer filter dimension')
+parser.add_argument('--n_layers', dest='n_layers', default=8, type=int,
+                    help='Number of layers preceding bottleneck')
+parser.add_argument('--skip', dest='skip', default=[4], type=list,
+                    help='Layers at which to apply input residual')
+parser.add_argument('--use_fine', dest='use_fine', default=False, type=bool,
+                    help='Creates and uses fine NeRF model')
+parser.add_argument('--d_filter_fine', dest='d_filter_fine', default=128,
+                    type=int, help='Linear layer filter dim for fine model')
+parser.add_argument('--n_layers_fine', dest='n_layers_fine', default=8,
+                    type=int, help='Number of fine layers preceding bottleneck')
+
+# Stratified sampling
+parser.add_argument('--n_samples', dest='n_samples', default=64, type=int,
+                    help='Number of stratified samples per ray')
+parser.add_argument('--perturb', dest='perturb', default=True, type=bool,
+                    help='Apply noise to spatial coords')
+parser.add_argument('--inv_depth', dest='inv_depth', default=False, type=bool,
+                    help='Sample points linearly in inverse depth')
+
+# Hierarchical sampling
+parser.add_argument('--n_samples_hierch', dest='n_samples_hierch', default=64,
+                    type=int, help='Number of hierarchical samples per ray')
+parser.add_argument('--perturb_hierch', dest='perturb_hierch', default=True,
+                    type=bool, help='Applies noise to hierarchical samples')
+
+# Optimization
+parser.add_argument('--lrate', dest='lrate', default=5e-4, type=float,
+                    help='Learning rate')
+
+# Training 
+parser.add_argument('--n_iters', dest='n_iters', default=1e4, type=int,
+                    help='Number of training iterations')
+parser.add_argument('--batch_size', dest='batch_size', default=2**12, type=int,
+                    help='Number of rays per optimization step')
+parser.add_argument('--chunksize', dest='chunksize', default=2**12, type=int,
+                    help='Batch is divided into chunks to avoid OOM error')
+
+# Validation
+parser.add_argument('--display_rate', dest='display_rate', default=50, type=int,
+                    help='Display rate for test output measured in iterations')
+parser.add_argument('--val_rate', dest='val_rate', default=25, type=int,
+                    help='Test image evaluation rate')
+
+# Early Stopping
+parser.add_argument('--warmup_iters', dest='warmup_iters', default=100,
+                    type=int, help='Number of iterations for warmup phase')
+parser.add_argument('--min_fitness', dest='min_fitness', default=14.5,
+                    type=float, help='Minimum PSNR value to continue training')
+parser.add_argument('--n_restarts', dest='n_restarts', default=10, type=int,
+                    help='Maximum number of restarts if training stalls')
+
+args = parser.parse_args()
+
+# Bundle the kwargs for various functions to pass all at once
+kwargs_sample_stratified = {
+    'n_samples': args.n_samples,
+    'perturb': args.perturb,
+    'inverse_depth': args.inv_depth
+}
+
+kwargs_sample_hierarchical = {
+    'perturb': args.perturb_hierch
+}
+
+kwargs_sample_normal = {
+    'n_samples': args.n_samples,
+    'inverse_depth': args.inv_depth
+}
 
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -59,18 +147,6 @@ def plot_samples(
 
     return ax
 
-def crop_center(
-    img: torch.Tensor,
-    frac: float = 0.5
-    ) -> torch.Tensor:
-    r"""
-    Crop center square from image.
-    """
-    h_offset = round(img.shape[0] * (frac / 2))
-    w_offset = round(img.shape[1] * (frac / 2))
-
-    return img[h_offset:-h_offset, w_offset:-w_offset]
-
 class EarlyStopping:
     r"""
     Early stopping helper class based on fitness criterion.
@@ -102,65 +178,6 @@ class EarlyStopping:
 
         return stop
 
-# HYPERPARAMETERS 
-
-# Encoders
-d_input = 3             # Number of input dimensions
-n_freqs = 10            # Number of encoding functions for samples
-log_space = True        # If set, frecuencies scale in log space
-use_viewdirs = True     # If set, model view dependen effects
-n_freqs_views = 4       # Number of encoding functions for views
-
-# Stratified sampling
-n_samples = 64          # Number of spatial samples per ray
-perturb = True          # If set, applies noise to sample positions
-inverse_depth = False   # If set, sample points linearly in inverse depth
-
-# Model
-d_filter = 128          # Dimension of linear layer filters
-n_layers = 8            # Number of layers in network bottleneck
-skip = [4]              # Layers at which to apply input residual
-use_fine_model = False  # If set, creates a fine model
-d_filter_fine = 128     # Dimension of linear layer filters of fine network
-n_layers_fine = 6       # Number of layers in fine network bottleneck
-
-# Hierarchical sampling
-n_samples_hierarchical = 64     # Number of samples per ray
-perturb_hierarchical = True    # If set, applies noise to sample positions
-
-# Optimizer
-lrate = 5e-4            # Learning rate
-
-# Training 
-n_iters = 1e6
-batch_size = 2**12          # Number of rays per gradient step
-one_image_per_step = False  # One image per gradient step (disables batching)
-chunksize = 2**12           # Modify as needed to fit in GPU memory
-center_crop = False         # Crop the center of image (one_image_per_)
-center_crop_iters = 100      # Stop cropping center after this many epochs
-display_rate = 50           # Display test output every X epochs
-val_rate = 25               # Evaluation of test image rate
-
-# Early Stopping
-warmup_iters = 2500           # Number of iterations during warmup phase
-warmup_min_fitness = 14.5   # Min val PSNR to continue training at warmup_iters
-n_restarts = 20             # Number of times to restart if training stalls
-
-# Bundle the kwargs for various functions to pass all at once
-kwargs_sample_stratified = {
-    'n_samples': n_samples,
-    'perturb': perturb,
-    'inverse_depth': inverse_depth
-}
-
-kwargs_sample_hierarchical = {
-    'perturb': perturb_hierarchical
-}
-
-kwargs_sample_normal = {
-    'n_samples': n_samples,
-    'inverse_depth': inverse_depth
-}
 
 # MODELS INITIALIZATION
 
@@ -169,13 +186,14 @@ def init_models():
     Initialize models, encoders and optimizer for NeRF training
     """
     # Encoders
-    encoder = PositionalEncoder(d_input, n_freqs, log_space=log_space)
+    encoder = PositionalEncoder(args.d_input, args.n_freqs,
+                                log_space=args.log_space)
     encode = lambda x: encoder(x)
 
     # Check if using view directions to initialize encoders
-    if use_viewdirs:
-        encoder_viewdirs = PositionalEncoder(d_input, n_freqs_views,
-                                             log_space=log_space)
+    if args.use_viewdirs:
+        encoder_viewdirs = PositionalEncoder(args.d_input, args.n_freqs_views,
+                                             log_space=args.log_space)
         encode_viewdirs = lambda x: encoder_viewdirs(x)
         d_viewdirs = encoder_viewdirs.d_output
     else:
@@ -183,13 +201,15 @@ def init_models():
         d_viewdirs = None
 
     # Models
-    model = NeRF(encoder.d_output, n_layers=n_layers, d_filter=d_filter,
-                 skip=skip, d_viewdirs=d_viewdirs)
+    model = NeRF(encoder.d_output, n_layers=args.n_layers, 
+                 d_filter=args.d_filter, skip=args.skip,
+                 d_viewdirs=d_viewdirs)
     model.to(device)
     model_params = list(model.parameters())
-    if use_fine_model:
-        fine_model = NeRF(encoder.d_output, n_layers=n_layers, 
-                          d_filter=d_filter, skip=skip, d_viewdirs=d_viewdirs)
+    if args.use_fine:
+        fine_model = NeRF(encoder.d_output, n_layers=args.n_layers, 
+                          d_filter=args.d_filter, skip=args.skip,
+                          d_viewdirs=d_viewdirs)
         fine_model.to(device)
         model_params = model_params + list(fine_model.parameters())
     else:
@@ -208,13 +228,15 @@ def train(mu=0.005):
     """
     # Create data loader
     dataloader = DataLoader(dataset,
-                            batch_size=batch_size,
+                            batch_size=args.batch_size,
                             shuffle=True,
                             num_workers=8)
 
     # Optimizer and scheduler
-    optimizer = torch.optim.Adam(model.parameters(), lr=lrate)
-    scheduler = CustomScheduler(optimizer, n_iters, n_warmup=warmup_iters)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate)
+    scheduler = CustomScheduler(optimizer,
+                                args.n_iters,
+                                n_warmup=args.warmup_iters)
 
     train_psnrs = []
     val_psnrs = []
@@ -223,8 +245,8 @@ def train(mu=0.005):
     testimg, testpose = dataset.testimg.to(device), dataset.testpose.to(device)
 
     # Compute number of epochs
-    steps_per_epoch = np.ceil(len(dataset)/batch_size)
-    epochs = np.ceil(n_iters / steps_per_epoch)
+    steps_per_epoch = np.ceil(len(dataset)/args.batch_size)
+    epochs = np.ceil(args.n_iters / steps_per_epoch)
 
     for i in range(int(epochs)):
         print(f"Epoch {i + 1}")
@@ -266,7 +288,7 @@ def train(mu=0.005):
                            kwargs_sample_normal=kwargs_sample_normal,
                            fine_model=fine_model,
                            viewdirs_encoding_fn=encode_viewdirs,
-                           chunksize=rays_d.shape[0])
+                           chunksize=args.chunksize)
 
             # Check for numerical issues
             for key, val in outputs.items():
@@ -329,7 +351,7 @@ def train(mu=0.005):
             optimizer.zero_grad()
             scheduler.step()
 
-            if step % val_rate == 0:
+            if step % args.val_rate == 0:
                 with torch.no_grad():
                     model.eval()
 
@@ -344,7 +366,7 @@ def train(mu=0.005):
                            kwargs_sample_normal=kwargs_sample_normal,
                            fine_model=fine_model,
                            viewdirs_encoding_fn=encode_viewdirs,
-                           chunksize=chunksize)
+                           chunksize=args.chunksize)
                     
                     # Compute middle points for intervals
                     mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
@@ -357,7 +379,7 @@ def train(mu=0.005):
 
                     val_psnrs.append(val_psnr.item())
                     iternums.append(step)
-                    if step % display_rate == 0:
+                    if step % args.display_rate == 0:
                         logger.setLevel(100)
 
                         # Plot example outputs
@@ -376,7 +398,7 @@ def train(mu=0.005):
                         ax[1,1].imshow(mids.reshape([H, W]).cpu().numpy(),
                                      vmin=0., vmax=7.5)
                         ax[1,1].set_title('Target')
-                        z_vals_strat = outputs['z_vals_stratified'].view((-1, n_samples))
+                        z_vals_strat = outputs['z_vals_stratified'].view((-1, args.n_samples))
                         z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
                         if 'z_vals_hierarchical' in outputs:
                             z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
@@ -390,10 +412,10 @@ def train(mu=0.005):
                         logger.setLevel(base_level)
 
             # Check PSNR for issues and stop if any are found.
-            if step == warmup_iters - 1:
-                if val_psnr < warmup_min_fitness:
+            if step == args.warmup_iters - 1:
+                if val_psnr < args.min_fitness:
                     return False, train_psnrs, val_psnrs, 0
-            elif step < warmup_iters:
+            elif step < args.warmup_iters:
                 if warmup_stopper is not None and warmup_stopper(step, val_psnr):
                     return False, train_psnrs, val_psnrs, 1 
 
@@ -403,12 +425,12 @@ def train(mu=0.005):
     return True, train_psnrs, val_psnrs, 2
 
 # Run training session(s)
-for k in range(n_restarts):
+for k in range(args.n_restarts):
     print('Training attempt: ', k + 1)
     model, fine_model, encode, encode_viewdirs = init_models()
     success, train_psnrs, val_psnrs, code = train()
 
-    if success and val_psnrs[-1] >= warmup_min_fitness:
+    if success and val_psnrs[-1] >= args.min_fitness:
         print('Training successful!')
         break
     if not success and code == 0:
@@ -431,11 +453,11 @@ frames = render_path(render_poses=render_poses,
                      encode=encode,
                      model=model,
                      kwargs_sample_stratified=kwargs_sample_stratified,
-                     n_samples_hierarchical=n_samples_hierarchical,
+                     n_samples_hierarchical=args.n_samples_hierarchical,
                      kwargs_sample_hierarchical=kwargs_sample_hierarchical,
                      fine_model=fine_model,
                      encode_viewdirs=encode_viewdirs,
-                     chunksize=chunksize)
+                     chunksize=args.chunksize)
 
 # Now we put together frames and save result into .mp4 file
 render_video(basedir='out/video/',
