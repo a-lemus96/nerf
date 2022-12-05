@@ -403,7 +403,8 @@ def nerf_forward(
     far: float,
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
     coarse_model: nn.Module,
-    t_ivals: torch.Tensor = None,
+    mids: torch.Tensor = None,
+    stdevs: torch.Tensor = None,
     kwargs_sample_stratified: dict = None, 
     kwargs_sample_normal: dict = None,
     n_samples_hierarchical: int = 0,
@@ -417,10 +418,6 @@ def nerf_forward(
     Args:
     Returns:
     """
-    if t_ivals is not None:
-        # Compute mean and stdev for all intervals
-        means = (t_ivals[..., 0] + t_ivals[..., 1])/ 2.      
-        stdevs = t_ivals[..., 1] - t_ivals[..., 0]
 
     # Sample query points along each ray
     if kwargs_sample_stratified is not None:
@@ -428,9 +425,10 @@ def nerf_forward(
                                              **kwargs_sample_stratified)
 
     if kwargs_sample_normal is not None: 
-        query_points, z_vals = sample_normal(rays_o, rays_d, z_vals, means,
-                                             stdevs, near, far,
-                                             **kwargs_sample_normal)
+        if mids is not None and stdevs is not None:
+            query_points, z_vals = sample_normal(rays_o, rays_d, z_vals, mids,
+                                                 stdevs, near, far,
+                                                 **kwargs_sample_normal)
     
     outputs = {'z_vals_stratified': z_vals}
 

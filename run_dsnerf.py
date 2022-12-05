@@ -51,6 +51,10 @@ parser.add_argument('--perturb', dest='perturb', default=True, type=bool,
 parser.add_argument('--inv_depth', dest='inv_depth', default=False, type=bool,
                     help='Sample points linearly in inverse depth')
 
+# Normal sampling
+parser.add_argument('--n_samples_norm', dest='n_samples_norm', default=64,
+                    type=int, help='Number of samples from normal distribution')
+
 # Hierarchical sampling
 parser.add_argument('--n_samples_hierch', dest='n_samples_hierch', default=64,
                     type=int, help='Number of hierarchical samples per ray')
@@ -60,6 +64,8 @@ parser.add_argument('--perturb_hierch', dest='perturb_hierch', default=True,
 # Optimization
 parser.add_argument('--lrate', dest='lrate', default=5e-4, type=float,
                     help='Learning rate')
+parser.add_argument('--mu', dest='mu', default=1.0, type=float,
+                    help='Balancing factor for KL depth loss term')
 
 # Training 
 parser.add_argument('--n_iters', dest='n_iters', default=1e4, type=int,
@@ -97,7 +103,7 @@ kwargs_sample_hierarchical = {
 }
 
 kwargs_sample_normal = {
-    'n_samples': args.n_samples,
+    'n_samples': args.n_samples_norm,
     'inverse_depth': args.inv_depth
 }
 
@@ -222,7 +228,7 @@ def init_models():
 # Early stopping helper
 warmup_stopper = EarlyStopping(patience=100)
 
-def train(mu=0.005):
+def train():
     r"""
     Run NeRF training loop.
     """
@@ -248,6 +254,8 @@ def train(mu=0.005):
     steps_per_epoch = np.ceil(len(dataset)/args.batch_size)
     epochs = np.ceil(args.n_iters / steps_per_epoch)
 
+    # Initial factor
+    factor = 6.
     for i in range(int(epochs)):
         print(f"Epoch {i + 1}")
         model.train()
@@ -281,9 +289,14 @@ def train(mu=0.005):
 
             bkgd = bkgd.to(device)
 
+            # Compute middle points and interval lengths
+            mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
+            boxsize = t_ivals[..., 1] - t_ivals[..., 0]
+            factor = 0.98 * factor if step < args.warmup_iters else 1.
+
             # Run one iteration of NeRF and get the rendered RGB image
             outputs = nerf_forward(rays_o, rays_d,
-                           near, far, encode, model, t_ivals,
+                           near, far, encode, model, mids, boxsize,
                            kwargs_sample_stratified=kwargs_sample_stratified,
                            kwargs_sample_normal=kwargs_sample_normal,
                            fine_model=fine_model,
@@ -304,7 +317,6 @@ def train(mu=0.005):
             rgb_predicted = outputs['rgb_map']
             d_predicted = outputs['depth_map']
             weights = outputs['weights'] + 1e-12
-            #print(f'Weights: {weights.shape}')
             z_vals = outputs['z_vals_stratified']
 
             # Compute RGB loss
@@ -315,24 +327,18 @@ def train(mu=0.005):
                 psnr = -10. * torch.log10(loss)
                 train_psnrs.append(psnr.item())
 
-            # Compute middle points and interval lengths
-            mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
             mids = mids[..., None]
-            boxsize = t_ivals[..., 1] - t_ivals[..., 0]
-            boxsize = boxsize[..., None]
+            boxsize = factor * boxsize[..., None]
 
             # Compute distances between samples
             dists = z_vals[..., 1] - z_vals[..., 0]
             dists = dists[..., None] 
             # Compute KL depth loss 
-            d_loss = torch.log(weights)
-            #print(f'D loss after log: {d_loss.shape}')
+            d_loss = -torch.log(weights)
             d_loss = d_loss * torch.exp(-(z_vals - mids)**2 / (2 * boxsize)) * dists
-            #print(f'D loss after exp log: {d_loss}')
             d_loss = torch.sum(d_loss, -1)
             # Remove background from gradient calculation
-            d_loss = d_loss * ~bkgd[selection]
-
+            #d_loss = d_loss * ~bkgd[selection]
             
             # Remove nans from depth loss
             #filter_out = torch.logical_and(~torch.isnan(d_loss), ~torch.isinf(d_loss))
@@ -342,8 +348,19 @@ def train(mu=0.005):
             #print(d_loss)
             #exit()
 
+            if step % args.display_rate == 0:
+                # Plot termination distribution and Gaussian distribution
+                t = torch.linspace(1.2, 7.0, 2*args.n_samples, device=device)
+                prior = torch.exp(-(t - mids)**2 / (2 * boxsize))
+                #prior *=  1/(2*np.pi*torch.sqrt(boxsize))  
+                plt.figure()
+                plt.plot(z_vals[0].cpu().numpy(), weights[0].detach().cpu().numpy(), 'g-o')
+                plt.plot(t.cpu().numpy(), prior[0].detach().cpu().numpy(), 'b-o')
+                plt.savefig(f'out/h_{step}.png')
+                plt.close()
+
             # Compute total loss
-            loss += mu * torch.mean(d_loss)
+            loss += args.mu * torch.mean(d_loss)
 
             # Perform backprop and optimizer steps
             loss.backward()
@@ -359,9 +376,15 @@ def train(mu=0.005):
                     rays_o = rays_o.reshape([-1, 3])
                     rays_d = rays_d.reshape([-1, 3])
                     t_ivals = dataset.test_ivals.reshape([-1, 2]).to(device)
+                    
+                    # Compute middle points and interval lengths
+                    mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
+                    #mids = mids[..., None]
+                    boxsize = t_ivals[..., 1] - t_ivals[..., 0]
+                    #boxsize = boxsize[..., None]
 
                     outputs = nerf_forward(rays_o, rays_d,
-                           near, far, encode, model, t_ivals,
+                           near, far, encode, model, mids, boxsize,
                            kwargs_sample_stratified=kwargs_sample_stratified,
                            kwargs_sample_normal=kwargs_sample_normal,
                            fine_model=fine_model,
@@ -434,7 +457,7 @@ for k in range(args.n_restarts):
         print('Training successful!')
         break
     if not success and code == 0:
-        print(f'Val PSNR {val_psnrs[-1]} below warmup_min_fitness {warmup_min_fitness}. Stopping...')
+        print(f'Val PSNR {val_psnrs[-1]} below min_fitness {args.min_fitness}. Stopping...')
     elif not success and code == 1:
         print(f'Train PSNR flatlined for {warmup_stopper.patience} iters. Stopping...')
 
@@ -453,7 +476,7 @@ frames = render_path(render_poses=render_poses,
                      encode=encode,
                      model=model,
                      kwargs_sample_stratified=kwargs_sample_stratified,
-                     n_samples_hierarchical=args.n_samples_hierarchical,
+                     n_samples_hierarchical=args.n_samples_hierch,
                      kwargs_sample_hierarchical=kwargs_sample_hierarchical,
                      fine_model=fine_model,
                      encode_viewdirs=encode_viewdirs,
