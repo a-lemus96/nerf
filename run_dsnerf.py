@@ -1,13 +1,18 @@
+# Standard library imports
+import argparse
+import logging
 import os
+
+# Related third party imports
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# Local application/library specific imports
 from models import *
 from utilities import *
 from load_data import *
-import logging
-import argparse
-from tqdm import tqdm
 
 # For repeatability
 '''seed = 451
@@ -64,8 +69,10 @@ parser.add_argument('--perturb_hierch', dest='perturb_hierch', default=True,
 # Optimization
 parser.add_argument('--lrate', dest='lrate', default=5e-4, type=float,
                     help='Learning rate')
-parser.add_argument('--mu', dest='mu', default=1.0, type=float,
+parser.add_argument('--mu', dest='mu', default=0.1, type=float,
                     help='Balancing factor for KL depth loss term')
+parser.add_argument('--mu_1', dest='mu_1', default=0.1, type=float,
+                    help='Balancing factor for MSE depth loss term')
 
 # Training 
 parser.add_argument('--n_iters', dest='n_iters', default=1e4, type=int,
@@ -112,8 +119,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load dataset
 dataset = DSNerfDataset(basedir='data/bunny/',
-                        n_imgs=49,
+                        n_imgs=5,
                         test_idx=49,
+                        f_forward=True,
                         near=1.2,
                         far=7.)
 
@@ -240,9 +248,9 @@ def train():
 
     # Optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate)
-    scheduler = CustomScheduler(optimizer,
+    '''scheduler = CustomScheduler(optimizer,
                                 args.n_iters,
-                                n_warmup=args.warmup_iters)
+                                n_warmup=args.warmup_iters)'''
 
     train_psnrs = []
     val_psnrs = []
@@ -255,7 +263,7 @@ def train():
     epochs = np.ceil(args.n_iters / steps_per_epoch)
 
     # Initial factor
-    factor = 6.
+    #factor = 6.
     for i in range(int(epochs)):
         print(f"Epoch {i + 1}")
         model.train()
@@ -292,13 +300,21 @@ def train():
             # Compute middle points and interval lengths
             mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
             boxsize = t_ivals[..., 1] - t_ivals[..., 0]
-            factor = 0.98 * factor if step < args.warmup_iters else 1.
+            #factor = 0.98 * factor if step < args.warmup_iters else 1.
 
             # Run one iteration of NeRF and get the rendered RGB image
-            outputs = nerf_forward(rays_o, rays_d,
+            '''outputs = nerf_forward(rays_o, rays_d,
                            near, far, encode, model, mids, boxsize,
                            kwargs_sample_stratified=kwargs_sample_stratified,
                            kwargs_sample_normal=kwargs_sample_normal,
+                           fine_model=fine_model,
+                           viewdirs_encoding_fn=encode_viewdirs,
+                           chunksize=args.chunksize)'''
+            outputs = nerf_forward(rays_o, rays_d,
+                           near, far, encode, model,
+                           kwargs_sample_stratified=kwargs_sample_stratified,
+                           n_samples_hierarchical=args.n_samples_hierch,
+                           kwargs_sample_hierarchical=kwargs_sample_hierarchical,
                            fine_model=fine_model,
                            viewdirs_encoding_fn=encode_viewdirs,
                            chunksize=args.chunksize)
@@ -317,7 +333,7 @@ def train():
             rgb_predicted = outputs['rgb_map']
             d_predicted = outputs['depth_map']
             weights = outputs['weights'] + 1e-12
-            z_vals = outputs['z_vals_stratified']
+            z_vals = outputs['z_vals_combined']
 
             # Compute RGB loss
             loss = torch.nn.functional.mse_loss(rgb_predicted, target_pixs)
@@ -328,14 +344,17 @@ def train():
                 train_psnrs.append(psnr.item())
 
             mids = mids[..., None]
-            boxsize = factor * boxsize[..., None]
+            boxsize = boxsize[..., None]
 
             # Compute distances between samples
             dists = z_vals[..., 1] - z_vals[..., 0]
             dists = dists[..., None] 
+
             # Compute KL depth loss 
             d_loss = -torch.log(weights)
-            d_loss = d_loss * torch.exp(-(z_vals - mids)**2 / (2 * boxsize)) * dists
+            prior = torch.exp(-(z_vals - mids)**2 / (2 * boxsize))
+            prior = prior * ~bkgd[:, None] # Set bkgd prior to 0
+            d_loss = d_loss * prior * dists
             d_loss = torch.sum(d_loss, -1)
             # Remove background from gradient calculation
             #d_loss = d_loss * ~bkgd[selection]
@@ -348,25 +367,22 @@ def train():
             #print(d_loss)
             #exit()
 
-            if step % args.display_rate == 0:
-                # Plot termination distribution and Gaussian distribution
-                t = torch.linspace(1.2, 7.0, 2*args.n_samples, device=device)
-                prior = torch.exp(-(t - mids)**2 / (2 * boxsize))
-                #prior *=  1/(2*np.pi*torch.sqrt(boxsize))  
-                plt.figure()
-                plt.plot(z_vals[0].cpu().numpy(), weights[0].detach().cpu().numpy(), 'g-o')
-                plt.plot(t.cpu().numpy(), prior[0].detach().cpu().numpy(), 'b-o')
-                plt.savefig(f'out/h_{step}.png')
-                plt.close()
-
             # Compute total loss
             loss += args.mu * torch.mean(d_loss)
+            loss += args.mu_1 * torch.nn.functional.mse_loss(d_predicted,
+                                                             mids[:, 0]) 
 
             # Perform backprop and optimizer steps
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-            scheduler.step()
+            #scheduler.step()
+            ###   update learning rate   ###
+            decay_rate = 0.1
+            decay_steps = 250 * 1000
+            new_lrate = args.lrate * (decay_rate ** (step / decay_steps))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = new_lrate
 
             if step % args.val_rate == 0:
                 with torch.no_grad():
@@ -375,7 +391,7 @@ def train():
                     rays_o, rays_d = get_rays(H, W, focal, testpose)
                     rays_o = rays_o.reshape([-1, 3])
                     rays_d = rays_d.reshape([-1, 3])
-                    t_ivals = dataset.test_ivals.reshape([-1, 2]).to(device)
+                    t_ivals = dataset.test_t_ivals.reshape([-1, 2]).to(device)
                     
                     # Compute middle points and interval lengths
                     mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
@@ -383,19 +399,30 @@ def train():
                     boxsize = t_ivals[..., 1] - t_ivals[..., 0]
                     #boxsize = boxsize[..., None]
 
-                    outputs = nerf_forward(rays_o, rays_d,
+                    '''outputs = nerf_forward(rays_o, rays_d,
                            near, far, encode, model, mids, boxsize,
                            kwargs_sample_stratified=kwargs_sample_stratified,
                            kwargs_sample_normal=kwargs_sample_normal,
                            fine_model=fine_model,
                            viewdirs_encoding_fn=encode_viewdirs,
+                           chunksize=args.chunksize)'''
+
+                    outputs = nerf_forward(rays_o, rays_d,
+                           near, far, encode, model,
+                           kwargs_sample_stratified=kwargs_sample_stratified,
+                           n_samples_hierarchical=args.n_samples_hierch,
+                           kwargs_sample_hierarchical=kwargs_sample_hierarchical,
+                           fine_model=fine_model,
+                           viewdirs_encoding_fn=encode_viewdirs,
                            chunksize=args.chunksize)
-                    
-                    # Compute middle points for intervals
-                    mids = (t_ivals[:, 0] + t_ivals[:, 1]) / 2.            
+
+                    mids = mids[..., None]
+                    boxsize = boxsize[..., None]
 
                     rgb_predicted = outputs['rgb_map']
                     depth_predicted = outputs['depth_map']
+                    weights = outputs['weights']
+                    z_vals = outputs['z_vals_combined']
 
                     val_loss = torch.nn.functional.mse_loss(rgb_predicted, testimg.reshape(-1, 3))
                     val_psnr = -10. * torch.log10(val_loss)
@@ -421,7 +448,21 @@ def train():
                         ax[1,1].imshow(mids.reshape([H, W]).cpu().numpy(),
                                      vmin=0., vmax=7.5)
                         ax[1,1].set_title('Target')
-                        z_vals_strat = outputs['z_vals_stratified'].view((-1, args.n_samples))
+                        # Plot termination distribution and Gaussian distribution
+                        n_total= args.n_samples + args.n_samples_hierch
+                        t = torch.linspace(1.2, 7.0, n_total, device=device)
+                        prior = torch.exp(-(t - mids)**2 / (2 * boxsize))
+                        #prior *=  1/(2*np.pi*torch.sqrt(boxsize))  
+                        ax[1,2].plot(z_vals[64584].cpu().numpy(),
+                                weights[64584].detach().cpu().numpy(), 'g-o')
+                        ax[1,2].plot(t.cpu().numpy(),
+                                prior[64584].detach().cpu().numpy(), 'b')
+                        ax[1,2].set_title('Empirical (green) and prior (blue) termination distribution')
+                        ax[1,2].margins(0)
+                        plt.savefig(f"out/training/iteration_{step}.png")
+                        plt.close(fig)
+                        logger.setLevel(base_level)
+                        '''z_vals_strat = outputs['z_vals_stratified'].view((-1, args.n_samples))
                         z_sample_strat = z_vals_strat[z_vals_strat.shape[0] // 2].detach().cpu().numpy()
                         if 'z_vals_hierarchical' in outputs:
                             z_vals_hierarch = outputs['z_vals_hierarchical'].view((-1, n_samples_hierarchical))
@@ -430,10 +471,7 @@ def train():
                             z_sample_hierarch = None
                         _ = plot_samples(z_sample_strat, z_sample_hierarch, ax=ax[1,2])
                         ax[1,2].margins(0)
-                        plt.savefig(f"out/training/iteration_{step}.png")
-                        plt.close(fig)
-                        logger.setLevel(base_level)
-
+                        '''
             # Check PSNR for issues and stop if any are found.
             if step == args.warmup_iters - 1:
                 if val_psnr < args.min_fitness:

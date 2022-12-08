@@ -148,23 +148,44 @@ class NerfDataset(Dataset):
         basedir: str,
         n_imgs: int,
         test_idx: int,
-        near: int=2.,
-        far: int=7.):
+        f_forward: bool = False,
+        near: int = 2.,
+        far: int = 7.):
 
         # Initialize attributes
         self.basedir = basedir
         self.n_imgs = n_imgs
         self.test_idx = test_idx
         self.near = near # near and far sampling bounds for each ray
-        self.far = far 
+        self.far = far
 
-        # Load images and camera poses 
+        # Load images and camera poses
         data = load_blender(basedir)
         imgs, poses, hwf = data
 
         # Validation image
         self.testimg = imgs[test_idx]
         self.testpose = poses[test_idx]
+
+        if f_forward:
+            # Set central view arbitrarily
+            central = 15
+            # Retrieve camera origins
+            origins = poses[:, :3, 3]
+            # Compute camera distances to central camera
+            dists = torch.sum((origins[central] - origins)**2, -1)
+            # Sort distances and retrieve indices
+            _, select = torch.sort(dists)
+
+            # Select validation image and pose
+            self.test_idx = select[n_imgs]
+            self.testimg = imgs[self.test_idx]
+            self.testpose = poses[self.test_idx]
+
+            # Select training images and poses
+            self.inds = select[:n_imgs]
+            imgs = imgs[self.inds]
+            poses = poses[self.inds]
 
         H, W, self.focal = hwf
         self.H, self.W = int(H), int(W)
@@ -206,18 +227,30 @@ class DSNerfDataset(NerfDataset):
         basedir: str,
         n_imgs: int,
         test_idx: int,
+        f_forward: bool = False,
         near: int=2.,
         far: int=7.): 
         # Call base class constructor method
-        super().__init__(basedir, n_imgs, test_idx, near, far)
+        super().__init__(basedir, n_imgs, test_idx, f_forward, near, far)
 
         # Load images, camera poses and depth maps
         data = load_blender(basedir, depth=True)
         masks, ivals = data
+        test_mask = masks[self.test_idx]
+        masks = masks[self.inds]
         N = masks.shape[0]
  
         # Local rays
         self.local_dirs = get_rays(self.H, self.W, self.focal, local_only=True)
+
+        # Compute validation intervals
+        test_d_ivals = dmap_from_layers(masks=test_mask[None, ...], ivals=ivals)
+        test_d_ivals = torch.sum(test_d_ivals, 1)
+        test_d_ivals = -test_d_ivals[:, None, ...] 
+        test_t_ivals = test_d_ivals / self.local_dirs[..., -1, None] 
+        self.test_t_ivals = test_t_ivals.type(torch.float32)
+
+        # Expanded version of local rays according to number of training imgs
         local_dirs = self.local_dirs[None, None, ...].expand(N, 1, self.H,
                                                              self.W, 3)
 
@@ -225,12 +258,12 @@ class DSNerfDataset(NerfDataset):
         d_ivals = torch.sum(dmap_from_layers(masks=masks, ivals=ivals), 1)
         d_ivals = -d_ivals[:, None, ...]
         t_ivals = d_ivals / local_dirs[..., -1, None]
-        self.test_ivals = t_ivals[test_idx]
+        # Save test intervals for validation
+        self.test_ivals = t_ivals[self.test_idx]
         bkgd = masks[:, -1, ...].reshape(list(t_ivals.shape[:-1]) + [1])
         bkgd = bkgd.type(torch.float32)
         t_ivals = torch.cat((t_ivals, bkgd), -1)
 
-        t_ivals = t_ivals[:n_imgs]
         t_ivals = torch.permute(t_ivals, [0, 2, 3, 1, 4])
         t_ivals = t_ivals.reshape([-1, t_ivals.shape[3], 3])
         t_ivals = torch.transpose(t_ivals, 0, 1)
@@ -241,5 +274,5 @@ class DSNerfDataset(NerfDataset):
         rays_o, rays_d, target_pixs = self.rays_rgb[:, idx]
         t_ivals = self.t_ivals[idx, ..., :2]
         bkgds = self.t_ivals[idx, ..., 2]
- 
+
         return rays_o, rays_d, target_pixs, t_ivals, bkgds

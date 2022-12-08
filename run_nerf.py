@@ -106,8 +106,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load dataset
 dataset = NerfDataset(basedir='data/bunny/',
-                      n_imgs=49,
+                      n_imgs=10,
                       test_idx=49,
+                      f_forward=True,
                       near=1.2,
                       far=7.)
 
@@ -357,7 +358,7 @@ def train():
 
             # Check PSNR for issues and stop if any are found.
             if step == args.warmup_iters - 1:
-                if val_psnr < args.warmup_min_fitness:
+                if val_psnr < args.min_fitness:
                     return False, train_psnrs, val_psnrs, 0
             elif step < args.warmup_iters:
                 if warmup_stopper is not None and warmup_stopper(step, val_psnr):
@@ -377,7 +378,7 @@ for k in range(args.n_restarts):
         print('Training successful!')
         break
     if not success and code == 0:
-        print(f'Val PSNR {val_psnrs[-1]} below warmup_min_fitness {warmup_min_fitness}. Stopping...')
+        print(f'Val PSNR {val_psnrs[-1]} below warmup_min_fitness {args.min_fitness}. Stopping...')
     elif not success and code == 1:
         print(f'Train PSNR flatlined for {warmup_stopper.patience} iters. Stopping...')
 
