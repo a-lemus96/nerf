@@ -1,5 +1,6 @@
 # Standard library imports
 import argparse
+from datetime import date
 import logging
 import os
 
@@ -69,9 +70,9 @@ parser.add_argument('--perturb_hierch', dest='perturb_hierch', default=True,
 # Optimization
 parser.add_argument('--lrate', dest='lrate', default=5e-4, type=float,
                     help='Learning rate')
-parser.add_argument('--mu', dest='mu', default=0.1, type=float,
+parser.add_argument('--mu', dest='mu', default=1e-1, type=float,
                     help='Balancing factor for KL depth loss term')
-parser.add_argument('--mu_1', dest='mu_1', default=0.1, type=float,
+parser.add_argument('--mu_1', dest='mu_1', default=1e-1, type=float,
                     help='Balancing factor for MSE depth loss term')
 
 # Training 
@@ -114,8 +115,36 @@ kwargs_sample_normal = {
     'inverse_depth': args.inv_depth
 }
 
+# Verify cuda availability
+if torch.cuda.is_available():
+    print(f"Device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+else:
+    print("Device: CPU")
+
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Set output directories
+out_dir = os.path.normpath(os.path.join('out', 'ds_nerf', str(date.today()),
+                                        'lrate_' + str(args.lrate),
+                                        ('m_' + str(args.mu)
+                                         + '_m1_' + str(args.mu_1))))
+
+# Create directories
+try:
+    os.makedirs(os.path.join(out_dir, 'training'))
+except:
+    pass
+
+try:
+    os.makedirs(os.path.join(out_dir, 'video'))
+except:
+    pass
+
+try:
+    os.makedirs(os.path.join(out_dir, 'model'))
+except:
+    pass
 
 # Load dataset
 dataset = DSNerfDataset(basedir='data/bunny/',
@@ -452,14 +481,14 @@ def train():
                         n_total= args.n_samples + args.n_samples_hierch
                         t = torch.linspace(1.2, 7.0, n_total, device=device)
                         prior = torch.exp(-(t - mids)**2 / (2 * boxsize))
-                        #prior *=  1/(2*np.pi*torch.sqrt(boxsize))  
+                        prior = prior * 1/(2 * np.pi * torch.sqrt(boxsize))  
                         ax[1,2].plot(z_vals[64584].cpu().numpy(),
                                 weights[64584].detach().cpu().numpy(), 'g-o')
                         ax[1,2].plot(t.cpu().numpy(),
                                 prior[64584].detach().cpu().numpy(), 'b')
                         ax[1,2].set_title('Empirical (green) and prior (blue) termination distribution')
                         ax[1,2].margins(0)
-                        plt.savefig(f"out/training/iteration_{step}.png")
+                        plt.savefig(f"{out_dir}/training/iteration_{step}.png")
                         plt.close(fig)
                         logger.setLevel(base_level)
                         '''z_vals_strat = outputs['z_vals_stratified'].view((-1, args.n_samples))
@@ -499,6 +528,8 @@ for k in range(args.n_restarts):
     elif not success and code == 1:
         print(f'Train PSNR flatlined for {warmup_stopper.patience} iters. Stopping...')
 
+# Save model
+torch.save(model, out_dir + '/model/dsnerf')
 
 # Compute camera poses along video rendering path
 render_poses = [pose_from_spherical(3.5, 45., phi)
@@ -521,5 +552,5 @@ frames = render_path(render_poses=render_poses,
                      chunksize=args.chunksize)
 
 # Now we put together frames and save result into .mp4 file
-render_video(basedir='out/video/',
+render_video(basedir=f'{out_dir}/video/',
              frames=frames)

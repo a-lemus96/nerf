@@ -1,13 +1,19 @@
+# Standard library imports
+import argparse
+from datetime import date
+import logging
 import os
+
+# Related third party imports
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# Local application/library specific imports
 from models import *
 from utilities import *
 from load_data import *
-import logging
-import argparse
-from tqdm import tqdm
 
 # For repeatability
 '''seed = 451
@@ -101,8 +107,17 @@ kwargs_sample_normal = {
     'inverse_depth': args.inv_depth
 }
 
+# Verify cuda availability
+if torch.cuda.is_available():
+    print(f"Device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+else:
+    print("Device: CPU")
+
 # Use cuda device if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Set output directory
+out_dir = os.path.normpath(os.path.join('out', 'nerf', str(date.today())))
 
 # Load dataset
 dataset = NerfDataset(basedir='data/bunny/',
